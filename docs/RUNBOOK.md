@@ -77,13 +77,16 @@ cd code/business_entity_resolution
 # Smoke test on 5% slice, max 3 chunks. Validates code path & RAM.
 python scripts/block_features.py \
     --candidate-source S2 --dry-run --max-chunks 3
-# Expect: ~5 min wall-clock, peak RAM <4 GB, NO final parquet written.
+# Expect: ~1-2 min wall-clock, 3 chunk lines printed in <30 s each, NO final parquet written.
+# Clean up smoke chunks before the real run:
+rm -rf artifacts/_chunks
 
 # Full S2 run
 python scripts/block_features.py \
     --candidate-source S2
-# Writes: artifacts/block_S2_features.parquet (~50M rows × 36 cols, ~3 GB on disk).
-# Wall-clock on AWS t3.medium: ~50-80 min. On 8-core box: ~25-40 min.
+# Writes: artifacts/block_S2_features.parquet (~50M rows × 40 cols, ~3 GB on disk).
+# Wall-clock on AWS t3.medium (2 vCPU / 8 GiB):    ~50-80 min
+# Wall-clock on 8 vCPU / 32 GiB (this user's box): ~30-50 min
 ```
 
 ### 3b. S3 run (on the SAME machine after S2 finishes, OR a different machine)
@@ -108,8 +111,8 @@ python scripts/block_features.py \
     --candidate-source S2 --suffix S2_TEST
 python scripts/block_features.py \
     --candidate-source S3 --suffix S3_TEST
-# Writes artifacts/block_S{2,3}_TEST_features.parquet (each ~1.5 GB).
-# Wall-clock each: ~30 min on AWS t3.medium.
+# Writes artifacts/block_S{2,3}_TEST_features.parquet (each ~1.5-2 GB).
+# Wall-clock per direction on t3.medium: ~30 min; on 8 vCPU / 32 GB: ~15-20 min.
 # IMPORTANT: do this ONCE and cache. Subsequent model iterations just
 # load these parquets in `predict.py` — no re-blocking.
 ```
@@ -118,24 +121,31 @@ python scripts/block_features.py \
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--candidate-source` | (required) | `S2`, `S3`, or `S3_TEST` etc. (any string ending the output suffix) |
-| `--top-k` | `50` | Per-S1 cap (was 25 in v2; do NOT lower without checking recall) |
+| `--candidate-source` | (required) | `S2`, `S3`, `S2_TEST`, `S3_TEST` (any custom suffix is fine) |
+| `--top-k` | `50` | Final per-S1 cap (HARD 50 per STATUS.md; do NOT lower without recall re-check) |
+| `--top-k-index` | `50` | Per-index candidates per S1 (before union + quality filter) |
 | `--chunk-size` | `10000` | S1 rows per chunk (raise to lower RAM; lower to fit tighter boxes) |
-| `--bucket-cap` | `500` | Max S2 ids per structural-key bucket |
-| `--sn-window` | `50` | Sorted-token neighborhood window ±W |
-| `--trigram-cap` | N/A | (v3 has no char trigrams; flag ignored or removed) |
-| `--max-chunks` | `None` | Run only the first N chunks (for testing) |
+| `--bucket-cap` | `500` | Max cand ids per structural-key bucket |
+| `--token-cap` | `500` | Max cand ids per word-token bucket (Index 2) |
+| `--sn-window` | `50` | Sorted-token neighborhood window ±W (101 candidates per S1) |
+| `--max-chunks` | `None` | Run only the first N chunks (for smoke testing) |
 | `--dry-run` | `False` | Process a 5% slice and skip final concat |
 | `--suffix` | (auto) | Output suffix; `--suffix S2_TEST` writes `block_S2_TEST_features.parquet` |
-| `--top-k-tfidf` | (n/a) | v3 doesn't have a separate "tfidf" pre-cap |
+
+Removed in v3 (kept here for reference only):
+| `--trigram-cap` | (n/a) | v2 had char-trigrams; v3 uses word-tokens instead |
+| `--top-k-tfidf` | (n/a) | v2's separate per-probe pre-cap; v3 uses a single `--top-k-index` |
 
 ### 3e. RAM diagnosis
 
 If you OOM:
 
-- Lower `--chunk-size` to 5000 → halves working-set RAM, ~2× slower per chunk.
-- Lower `--bucket-cap` to 200 → halves inverted-index RAM.
-- Lower `--sn-window` to 25 → halves sorted-neighborhood work.
+- Lower `--chunk-size` to 5000 → halves working-set RAM, ~same speed (probes are polars-vectorized).
+- Lower `--bucket-cap` to 200 → halves structural-index RAM (~700 MB → ~350 MB).
+- Lower `--token-cap` to 200 → halves token-index RAM (~900 MB → ~450 MB).
+- Lower `--sn-window` to 25 → halves sorted-neighborhood candidates; minor gain (~10 s less per chunk).
+
+The v3 polars-vectorized implementation uses **~2.5 GB peak** on the 8 GiB t3.medium box (indexes are polars DFs, not Python dicts). A 5 GB box is theoretically sufficient; 8 GB is comfortable.
 
 ---
 
@@ -270,17 +280,30 @@ zip -r submission.zip output/ code/business_entity_resolution/ Documentation_tem
 - **Quality-tier filter is OR, not AND**: a candidate is kept if it passes at least one of the four floors.
 - **Structural contribution is capped at 3** in composite score (`min(n_struct_keys, 3) / 3`), not 8.
 - **AWS t3.medium is enough for blocking** but NOT for training. Move to a ≥32 GiB box for Phase E.
+- **`--trigram-cap` was a v2 flag**: v3 dropped char-trigrams in favor of word-tokens (`--token-cap`). Don't pass `--trigram-cap`; it no longer exists.
+- **Clean `artifacts/_chunks/` between runs**: the script auto-cleans at start (real runs only, not `--dry-run`), so a smoke test followed by a real run will discard smoke chunk files automatically. But if you ever interrupt with `Ctrl-C`, do `rm -rf artifacts/_chunks/*` before restarting.
+- **Probe results must be unionable**: the three probes return DFs with the same 3 cols (`source1_entity_id, candidate_entity_id, <metric>`); the script `full`-joins them with `coalesce=True`. If you ever modify a probe, keep this 3-col schema invariant or the union breaks.
 
 ---
 
 ## 9. Memory + time budget (quick reference)
 
-| Stage | Min CPU | Min RAM | Disk | Wall-clock |
-| --- | --- | --- | --- | --- |
-| Phase C v3 (per direction) | 2 vCPU | **8 GiB** | 30 GB | 50-80 min on AWS t3.medium |
-| Phase C2 (combine + validate) | 2 vCPU | 8 GiB | 5 GB | <5 min |
-| Phase E (LightGBM) | 8 cores | **32 GiB** | 50 GB | 3-5 h |
-| Phase F (one-time test block) | 2 vCPU | 8 GiB | +3 GB | ~50 min/direction |
-| Phase F (model iteration) | 2 vCPU | 8 GiB | 0 | 5-10 min |
-| Phase G | 4 cores | 16 GiB | +1 GB | ~15 min |
-| Phase H (packaging) | 2 vCPU | 8 GiB | +1 GB | <5 min |
+| Stage | Min CPU | Min RAM | Disk | Wall-clock (this box: 8 vCPU / 32 GiB) | Wall-clock (AWS t3.medium: 2 vCPU / 8 GiB) |
+| --- | --- | --- | --- | --- | --- |
+| Phase C v3 (per direction, vectorized) | 2 vCPU | **8 GiB** | 30 GB | **30-50 min** | 50-80 min |
+| Phase C2 (combine + validate) | 2 vCPU | 8 GiB | 5 GB | <5 min | <5 min |
+| Phase E (LightGBM training) | 8 cores | **32 GiB** | 50 GB | 3-5 h (this box fits) | OOMs on t3.medium |
+| Phase F (one-time test block) | 2 vCPU | 8 GiB | +3 GB | ~25 min/direction | ~50 min/direction |
+| Phase F (model iteration) | 2 vCPU | 8 GiB | 0 | 5-10 min | 5-10 min |
+| Phase G | 4 cores | 16 GiB | +1 GB | ~15 min | ~30 min |
+| Phase H (packaging) | 2 vCPU | 8 GiB | +1 GB | <5 min | <5 min |
+
+Speedup notes:
+- v3 vectorized per-chunk time: ~10-15 s (8 vCPU) vs ~60 s (Python-loop original).
+  The vectorization (polars `DataFrame` indexes + SIMD joins) is the dominant
+  reason the times dropped on the same hardware.
+- The 8 vCPU / 32 GB box does *not* speed up per-chunk time proportionally to
+  CPU count beyond ~2-4 cores (the polars ops already use all cores, but the
+  rapidfuzz Python loop in `compute_fuzzy_features` is still single-threaded).
+  Most of the gain on this box over t3.medium comes from RAM headroom (32 vs 8 GB)
+  not from the extra vCPUs.
