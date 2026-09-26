@@ -19,40 +19,47 @@ Full problem statement: `data_set/student_resource/README.md` (canonical) and `p
 | Phase | Status | Output |
 |---|---|---|
 | A — env / packages | ✅ done | — |
-| B — normalization (libpostal `parse_address`) | ✅ done | `code/business_entity_resolution/artifacts/s{1,2,3}_norm_train.parquet` (~1.3 GB) |
-| **C — blocking** | 🔄 **in progress (S2 running, smoke test passed)** | per-chunk parquets in `code/business_entity_resolution/artifacts/_chunks/`; final `block_S2_features.parquet` produced on completion |
-| **D — feature engineering** | ✅ **done** | 27 features computed per candidate pair (output of `block_features.py`) |
-| E — LightGBM classifier + singleton detector | ⏸ pending | — |
-| F — inference + threshold | ⏸ pending | — |
-| G — graph refinement | ⏸ pending | — |
-| H — packaging (submission zip) | ⏸ pending | — |
+| B — normalization (libpostal `parse_address`) | ✅ done | `code/business_entity_resolution/artifacts/s{1,2,3}_norm_train.parquet` (~1.3 GB total) |
+| **C — blocking (v3 design locked-in, S2 ran with v2)** | 🔄 **v2 S2 produced; rebuilding with v3** | v2 output: `artifacts/block_S2_features.parquet` (1.55 GB). v3 will overwrite. |
+| **D — feature engineering** | ✅ done | 27 features per candidate pair |
+| E — LightGBM classifier + singleton detector | ⏸ pending | needs Phase C v3 done (recall must be ≥ 0.80 before training) |
+| F — inference + threshold | ⏸ pending | depends on Phase E |
+| G — graph refinement | ⏸ pending | depends on Phase F |
+| H — packaging (submission zip) | ⏸ pending | depends on Phase G |
 
-**Hybrid 8-structural-key + char-trigram blocker.** Phase C and D
-were merged into a single streaming script
-`code/business_entity_resolution/scripts/block_features.py` that
-runs on **8 GB RAM** (TF-IDF and MinHash dropped for RAM fit; fuzzy
-blocking falls back to a char-trigram inverted index capped at 100
-ids per trigram). Smoke test: 2 chunks produced 500K candidate pairs
-× 36 columns in ~225 s, RAM peak ≤ 7.5 GB. S2 run is in flight at
-~100 s/chunk (~5–6 h wall-clock total).
+**v3 blocker design — REPLACE the current `block_features.py`.** The v2 blocker (8 cheap structural keys + char-trigram inverted index) hit only **20.4% mean recall** on the train ground truth (median 0%; 50.7% of S1 entities had ZERO true matches recalled). v3 fix is locked-in — see `docs/STATUS.md` §Phase C v3 and the comments in `scripts/block_features.py`.
 
-See `docs/STATUS.md` for detailed state of each phase, what failed and why, and what to retry with new hardware.
+**Hard constraint recap (from user feedback)**:
+1. Country always same — hard pre-filter before any candidate survives.
+2. Stop-word + common-business-word list filters Index 2 token inverted index.
+3. Index 2 (tokens) and Index 3 (sorted-token neighborhood) both kept — overlap but each adds value.
+4. Per-S1 strict **50-candidate cap** (≤ 220 M rows total combined).
+5. Quality-tier floor is an **OR** of 4 hard conjunctions (one passing = keep the pair).
+6. Structural score is capped at `min(n_struct_keys, 3) / 3` (city/state/country trivially match; only road/house/name_fw/compounds are informative).
 
 ## How to start work
 
-1. **Read** `docs/STATUS.md` (current state + known failures).
-2. **Read** `docs/RUNBOOK.md` (concrete commands).
-3. **Skim** the plan at `~/.claude/plans/go-through-the-problem-bright-cosmos.md` — it's the authoritative spec for all phases.
+1. **Read** `docs/STATUS.md` — current state per phase, v3 design spec, hard-fail bugs.
+2. **Read** `docs/RUNBOOK.md` — concrete commands (block, combine, train, predict, validate).
+3. **Skim** `~/.claude/plans/deep-gliding-wombat.md` — full v3 plan with weights/ thresholds/ floors.
 4. **Check** Phase C state: `ls code/business_entity_resolution/artifacts/`
-   - If `s{1,2,3}_norm_train.parquet` exist → proceed to Phase C
-   - If `blocks_country=*_source=*.parquet` exist → blocking is done, run Phase C2 validation
+   - If `s{1,2,3}_norm_train.parquet` exist but no `block_*_features.parquet` exist → run Phase C v3.
+   - If `block_S{2,3}_features.parquet` both exist → proceed to Phase E.
+   - **NOTE**: v2 S2 ran but produced 20% recall; v3 will overwrite it.
 
-## Compute realities
+## Compute realities — confirmed working sizes
 
-- **Hardware target:** 18-core CPU + ≥16 GB RAM + ≥144 GB disk.
-- **No GPU needed.** This is a CPU-bound stack — see "Why CPU-bound" section below.
-- **No worker-heavy parallelism.** Each Python+heavy-lib worker uses ~1.0–1.5 GB peak. Cap at 4 workers on 16 GB; never exceed box's free RAM / 1.5 GB workers.
-- **Detached execution** for any stage > 5 min: use `setsid nohup bash -c "..." > /tmp/<stage>.log 2>&1 &` so Claude session timeouts don't kill the job.
+| Stage | Min CPU | Min RAM | Disk | Wall-clock |
+| --- | --- | --- | --- | --- |
+| v3 blocking (S2 or S3) | 2 vCPU | **8 GiB** | 30 GB | ~30-50 min / direction on 2 vCPU; ~20-30 min on 4 vCPU |
+| Phase E (LightGBM training) | 8 cores | 32 GiB | 50 GB | 3-5 h |
+| Phase F (test inference) | same as Phase C v3 | same | +1.5 GB output | 5-10 min (after test blocker cached) |
+
+- **v3 blocking fits in 8 GB RAM**, peak ~2.5 GB. **AWS t3.medium (2 vCPU / 8 GiB)** works — expect ~50-80 min for one direction.
+- **Phase E training needs ≥32 GiB RAM** (LightGBM histogram). Don't try to train on AWS t3.medium.
+- **No GPU needed** — CPU-only stack.
+- **Test blocker caching**: Phase F writes `block_S{2,3}_TEST_features.parquet` once (~50 min); every subsequent model iteration on test data is then 5-10 min (load + predict only).
+- **Detached execution** for any stage > 5 min: `setsid nohup bash -c "..." > /tmp/<stage>.log 2>&1 &` so Claude session timeouts don't kill the job.
 - **Source-of-truth data:** train files only during development. Test files touched only at Phase H.
 
 ## Code layout

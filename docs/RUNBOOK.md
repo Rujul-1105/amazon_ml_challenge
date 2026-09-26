@@ -1,58 +1,25 @@
 # RUNBOOK
 
-Concrete commands. Use this on every new machine or new Claude session.
+**Authoritative step-by-step commands.** Use this on every new machine
+or new Claude session. Read `docs/STATUS.md` first — it lists current
+state, hard-fail bugs to avoid, and the v3 blocker design rationale.
 
-## 0. First-time setup (one time per machine)
+## Table of contents
 
-**a. System packages (Fedora):**
+1. First-time setup (one time per machine)
+2. Each new Claude session — start with these reads
+3. Phase C v3 — blocking (S2/S3 separately; run them on different machines if you want)
+4. Phase C2 — combine S2+S3 and validate recall
+5. Phase E — LightGBM training (needs ≥32 GiB RAM)
+6. Phase F — inference (test blocker cached once)
+7. Phase G + H — graph refinement, packaging
 
-```bash
-sudo dnf install -y autoconf automake libtool pkg-config curl git gcc make file
-```
+---
 
-**b. libpostal (C library + 2 GB language models) into `/home/rujul/local/`:**
+## 1. First-time setup (one time per machine)
 
-```bash
-git clone https://github.com/openvenues/libpostal /tmp/libpostal
-cd /tmp/libpostal && ./build.sh && make install
-ldconfig
-cd /tmp/libpostal && ./libpostal/scripts/download_libpostal_data.sh
-```
-
-The build patches autotools to use a local prefix (`/home/rujul/local/usr/...`) instead of `/usr/...` — see `setup_env.sh` to set the env vars right. This was needed because no sudo on the prior hardware.
-
-`/home/rujul/local/` after install:
-- `bin/`: patched autoconf, automake, libtool, libtoolize, autom4te
-- `usr/bin/`: libpostal C tools
-- `lib/`: libpostal.so, libpostal.a, libpostal.so.1, libpostal.so.1.0.1
-- `include/`: libpostal.h, log/log.h
-- `share/libpostal/`: 2 GB of parsed language data (this is the disk-cost part)
-- `share/autoconf/`, `share/automake-1.18/`: the autotools data files
-
-**c. Set up the env (always source this before Python):**
-
-```bash
-# /home/rujul/local/setup_env.sh content:
-export PATH=/home/rujul/local/patched-bin:/home/rujul/local/usr/bin:$PATH
-export PERL5LIB=/home/rujul/local/usr/share/autoconf:/home/rujul/local/usr/share/automake-1.18:/home/rujul/local/usr/lib64/perl5/vendor_perl:/home/rujul/local/usr/share/perl5/vendor_perl
-export M4=/home/rujul/local/usr/bin/m4
-export AUTOM4TE_CFG=/home/rujul/local/usr/share/autoconf/autom4te.cfg
-export AC_MACRODIR=/home/rujul/local/usr/share/autoconf
-export autom4te_perllibdir=/home/rujul/local/usr/share/autoconf
-export AUTOMAKE_LIBDIR=/home/rujul/local/usr/share/automake-1.18
-export AUTOCONF=/home/rujul/local/usr/bin/autoconf
-export ACLOCAL=/home/rujul/local/usr/bin/aclocal
-export AUTOHEADER=/home/rujul/local/usr/bin/autoheader
-export AUTOM4TE=/home/rujul/local/usr/bin/autom4te.patched
-export LD_LIBRARY_PATH=/home/rujul/local/lib:${LD_LIBRARY_PATH:-}
-export LIBPOSTAL_DATA_DIR=/home/rujul/local/share/libpostal
-export LIBPOSTAL_PREFIX=/home/rujul/local
-export PKG_CONFIG_PATH=/home/rujul/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}
-```
-
-`source /home/rujul/local/setup_env.sh` before any Python invocation that touches libpostal.
-
-**d. Python packages (pip install --user):**
+**a. Python packages** (only `pip install` step needed; libpostal is already
+installed on the AWS box the user has been using):
 
 ```bash
 python3 -m pip install --user polars pandas numpy scikit-learn \
@@ -60,194 +27,260 @@ python3 -m pip install --user polars pandas numpy scikit-learn \
     unidecode regex indic-transliteration joblib tqdm
 ```
 
-## 1. Each Claude session
+**b. Smoke check** before any blocking/training run:
 
-Start the session by reading these three files in order:
+```bash
+python -c "import polars, numpy, lightgbm, rapidfuzz; print('OK')"
+ls code/business_entity_resolution/artifacts/s{1,2,3}_norm_train.parquet
+# All three files must exist. If missing, re-run Phase B (libpostal normalize).
+```
 
-1. `/home/rujul/projects/a/amzn_ml/CLAUDE.md` (you are here)
-2. `/home/rujul/projects/a/amzn_ml/docs/STATUS.md` (current state)
-3. `/home/rujul/projects/a/amzn_ml/docs/RUNBOOK.md` (concrete commands — this file)
+---
 
-Then check what's already done:
+## 2. Each new Claude session — mandatory first reads
+
+Before doing **anything**, the next Claude session MUST read these three files in this order:
+
+1. `CLAUDE.md` (at the project root) — what we're building, current phase status, hardware realities.
+2. `docs/STATUS.md` — per-phase detailed state, **v3 blocker design spec, hard-fail bugs, expected recalls**.
+3. `docs/RUNBOOK.md` (this file) — concrete commands.
+
+Then verify what's already done:
 
 ```bash
 ls code/business_entity_resolution/artifacts/
-# Expect: eda_*.csv, eda_report.md, s{1,2,3}_norm_train.parquet
-# If blocks_*.parquet files exist too, blocking is done.
+# Expect: s{1,2,3}_norm_train.parquet (Phase B output)
+# Expect: block_S2_features.parquet OR NOT (depending on whether v3 S2 has run)
+# If block_features parquets present for both S2 and S3 → Phase C done, go to Phase E.
+# If only one direction done → run the missing one.
 ```
 
-## 2. Phase C — blocking (current: hybrid 8-structural + char-trigram)
-
-The original 12-key design (K1–K12 with TF-IDF + MinHash + Faiss) was
-abandoned for 8 GB RAM. The current blocker
-(`scripts/block_features.py`) is **streaming**, **RAM-bounded**, and
-**combines blocking + feature engineering** in a single pass per chunk.
-TF-IDF and MinHash are dropped; fuzzy blocking falls back to a
-**char-trigram inverted index** with per-trigram cap = 100.
+Then check disk and RAM:
 
 ```bash
-cd D:/Projects/Amazon_ML/amazon_ml_challenge
-
-# S1 ↔ S2 (do this first)
-python code/business_entity_resolution/scripts/block_features.py \
-    --candidate-source S2
-
-# S1 ↔ S3 (separate run; on a different machine is fine)
-python code/business_entity_resolution/scripts/block_features.py \
-    --candidate-source S3
+df -h code/business_entity_resolution/artifacts/  # need ~30 GB free
+free -h                                          # need 8 GB minimum for blocking
 ```
 
-**Defaults** (override via CLI flags):
+---
+
+## 3. Phase C v3 — blocking
+
+**This script already exists at `code/business_entity_resolution/scripts/block_features.py`**.
+If it doesn't (e.g., fresh repo clone), copy from the version committed to git.
+
+### 3a. S2-only run (on this machine)
+
+```bash
+cd code/business_entity_resolution
+
+# Smoke test on 5% slice, max 3 chunks. Validates code path & RAM.
+python scripts/block_features.py \
+    --candidate-source S2 --dry-run --max-chunks 3
+# Expect: ~5 min wall-clock, peak RAM <4 GB, NO final parquet written.
+
+# Full S2 run
+python scripts/block_features.py \
+    --candidate-source S2
+# Writes: artifacts/block_S2_features.parquet (~50M rows × 36 cols, ~3 GB on disk).
+# Wall-clock on AWS t3.medium: ~50-80 min. On 8-core box: ~25-40 min.
+```
+
+### 3b. S3 run (on the SAME machine after S2 finishes, OR a different machine)
+
+```bash
+python scripts/block_features.py \
+    --candidate-source S3
+# Writes: artifacts/block_S3_features.parquet (similar size).
+```
+
+### 3c. Test blocker caching (Phase F prep, run ONLY when needed)
+
+```bash
+# Test normalization MUST be re-run first because Phase B only ran on train.
+# Set TRAIN_ONLY=False at the top of src/config.py (one-time change).
+# Then run normalize_submit_files() in src/normalize.py to produce
+# artifacts/s{1,2,3}_norm_test.parquet.
+python -m src.normalize  # with TRAIN_ONLY=False — one-time cost ~10 min on AWS.
+
+# Block on test data with the SAME v3 design.
+python scripts/block_features.py \
+    --candidate-source S2 --suffix S2_TEST
+python scripts/block_features.py \
+    --candidate-source S3 --suffix S3_TEST
+# Writes artifacts/block_S{2,3}_TEST_features.parquet (each ~1.5 GB).
+# Wall-clock each: ~30 min on AWS t3.medium.
+# IMPORTANT: do this ONCE and cache. Subsequent model iterations just
+# load these parquets in `predict.py` — no re-blocking.
+```
+
+### 3d. CLI flags reference
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--top-k` | 25 | Final candidates per S1 after structural + trigram union |
-| `--top-k-tfidf` | 50 | Trigram-blocker candidates per S1 (pre-cap) |
-| `--chunk-size` | 10000 | S1 rows per chunk |
-| `--bucket-cap` | 500 | Max S2 ids per structural key bucket |
-| `--trigram-cap` | 100 | Max S2 ids per char-trigram bucket |
+| `--candidate-source` | (required) | `S2`, `S3`, or `S3_TEST` etc. (any string ending the output suffix) |
+| `--top-k` | `50` | Per-S1 cap (was 25 in v2; do NOT lower without checking recall) |
+| `--chunk-size` | `10000` | S1 rows per chunk (raise to lower RAM; lower to fit tighter boxes) |
+| `--bucket-cap` | `500` | Max S2 ids per structural-key bucket |
+| `--sn-window` | `50` | Sorted-token neighborhood window ±W |
+| `--trigram-cap` | N/A | (v3 has no char trigrams; flag ignored or removed) |
+| `--max-chunks` | `None` | Run only the first N chunks (for testing) |
+| `--dry-run` | `False` | Process a 5% slice and skip final concat |
+| `--suffix` | (auto) | Output suffix; `--suffix S2_TEST` writes `block_S2_TEST_features.parquet` |
+| `--top-k-tfidf` | (n/a) | v3 doesn't have a separate "tfidf" pre-cap |
 
-**Smoke test (5% slice, no final concat)** — quick verification:
+### 3e. RAM diagnosis
 
-```bash
-python code/business_entity_resolution/scripts/block_features.py \
-    --candidate-source S2 --dry-run --max-chunks 2
-```
+If you OOM:
 
-Expect: 2 chunks in ~50–225 s, ~500 K candidate pairs, 36-column
-parquets in `artifacts/_chunks/`. No `block_S2_features.parquet`
-written (dry-run skips final concat).
+- Lower `--chunk-size` to 5000 → halves working-set RAM, ~2× slower per chunk.
+- Lower `--bucket-cap` to 200 → halves inverted-index RAM.
+- Lower `--sn-window` to 25 → halves sorted-neighborhood work.
 
-**Detached run** (so Claude session timeouts don't kill it):
+---
 
-```bash
-setsid nohup bash -c "
-  cd D:/Projects/Amazon_ML/amazon_ml_challenge
-  python code/business_entity_resolution/scripts/block_features.py --candidate-source S2 \
-    > /tmp/block_S2.log 2>&1
-  echo 'EXIT_CODE='\$? >> /tmp/block_S2.log
-  touch /tmp/block_S2.done
-" </dev/null >/dev/null 2>&1 &
-disown
-echo 'Launched blocking job; tail /tmp/block_S2.log'
-```
+## 4. Phase C2 — combine S2+S3 + validate recall
 
-**Monitor every ~15 min** (use ScheduleWakeup if running in a Claude session):
+### 4a. Combine S2 + S3 blocked parquets
 
 ```bash
-tail -20 /tmp/block_S2.log     # progress
-free -h                         # RAM check
-ls -la code/business_entity_resolution/artifacts/   # output?
-ls /tmp/block_S2.done           # completion sentinel?
+cd code/business_entity_resolution
+python scripts/combine_block_features.py
+# Writes: artifacts/block_features.parquet (~110 M pairs × 36 cols, ~3 GB).
 ```
 
-**Expected timing on 8 GB RAM / 16 cores:**
-
-- Index build (one-time): 8 structural indexes ~30 s + trigram index
-  ~280 s + cand_dict ~50 s = ~6 min one-time
-- Per chunk (10K S1): ~100 s on this hardware
-- Total per direction: 220 chunks × 100 s + ~6 min = ~5–6 h
-- RAM peak observed: ≤ 7.5 GB (safe on 8 GB box)
-
-**Output schema** (`artifacts/block_{S2|S3}_features.parquet`, 36 cols):
-
-```
-source1_entity_id, candidate_entity_id, candidate_source,     # identity
-n_struct_keys, n_trigrams, block_score,                       # blocker signals
-s1_country, m__country, country_eq,
-name_first_token_eq, name_token_jaccard,
-name_n_chars_diff, cross_script_pair,
-addr_first_word_eq, addr_last_word_eq, addr_city_eq,
-addr_house_number_eq, addr_state_eq, addr_road_eq,
-addr_zip_eq, addr_unit_eq, addr_suburb_eq,
-s1_name_missing, m_name_missing, s1_addr_missing, m_addr_missing,
-name_token_set_ratio, name_partial_ratio, name_token_sort_ratio,
-name_ratio, name_latin_token_set_ratio,
-addr_token_set_ratio, addr_partial_ratio, addr_token_sort_ratio,
-addr_ratio, addr_latin_token_set_ratio                        # 27 features
-```
-
-## 3. Phase D — feature engineering
-
-**Done as part of Phase C** — see §2 above. The 27 features listed in
-the output schema are computed per candidate pair inside
-`block_features.py` and emitted to the same parquet.
-
-## 4. Combine S2 + S3 candidate parquets
-
-Once both `--candidate-source S2` and `--candidate-source S3` runs
-have finished, combine them vertically:
+### 4b. Validate recall (mandatory sanity check)
 
 ```bash
-python code/business_entity_resolution/scripts/combine_block_features.py
+python scripts/validate_block_recall.py \
+    --blocks artifacts/block_S2_features.parquet artifacts/block_S3_features.parquet
+# (or pass --blocks artifacts/block_features.parquet after combine)
+# Expect: overall recall ≥ 0.85. Exit code 0 if recall target met, else 2.
 ```
 
-This writes `artifacts/block_features.parquet` (~100 M rows × 36 cols).
+If recall < 0.80, do NOT proceed to Phase E. Debug:
 
-## 5. Recall validation
+1. Print per-bucket recall (`U.S.|S2`, `U.S.|S3`, `India|S2`, `India|S3`).
+2. If `U.S.|S2` recall is high but `India|S2` low → sorted-token neighborhood may need a bigger window for transliterated names; consider raising `--sn-window` to 100.
+3. If both axes are uniformly low → quality-tier filter is too strict; lower floor B from `n_tokens_shared ≥ 2` to `≥ 1`.
+4. Inspect `artifacts/match_insights.md` and `artifacts/norm_similarity_insights.md` for the data-driven thresholds.
 
-Verify blocking recall vs `train_ground_truth.tsv` on a 10% holdout:
+---
+
+## 5. Phase E — LightGBM training
+
+**Hardware target: ≥32 GiB RAM / 16 cores / 50 GB SSD.** Do **not** try to train on AWS t3.medium (8 GiB) — it will OOM.
+
+### 5a. Prepare training data
 
 ```bash
-python code/business_entity_resolution/scripts/validate_block_recall.py
+cd code/business_entity_resolution
+python scripts/prepare_training_data.py
+# Reads: block_features.parquet (~110 M rows) + dataset/train/train_ground_truth.tsv.
+# Writes: artifacts/training_data.parquet (~110 M rows × 37 cols, ~3 GB).
+# Wall-clock: ~5-10 min.
 ```
 
-Expect overall recall **≥ 0.80** (we dropped TF-IDF/MinHash vs the
-project's original 0.92 target). Exit code 0 on pass, 2 on fail.
-
-## 6. Phase E — model training
+### 5b. Train LightGBM
 
 ```bash
-cd D:/Projects/Amazon_ML/amazon_ml_challenge
-setsid nohup bash -c "
-  cd D:/Projects/Amazon_ML/amazon_ml_challenge
-  python code/business_entity_resolution/scripts/train_classifier.py > /tmp/lgbm.log 2>&1
-  echo 'EXIT_CODE='\$? >> /tmp/lgbm.log
-  touch /tmp/lgbm.done
-" </dev/null >/dev/null 2>&1 &
-disown
-python code/business_entity_resolution/scripts/singleton_detector.py  # separate model
+python scripts/train_classifier.py
+# 3-stage search:
+#   1) Coarse grid (manual, 20 M-row sample)         ~30 min
+#   2) Optuna refinement (TPE, 30 trials)             ~2 h
+#   3) Final fit at best params (50-80 M rows)          ~1.5-2 h
+# Writes: artifacts/lgbm_classifier.txt.
+# Wall-clock total on 16-core / 32 GB: ~4-5 h.
 ```
 
-## 7. Phase F — inference + threshold
-
-Same detached pattern. Reads `block_features.parquet`, predicts on
-`test_*` ONCE here. Per-(country, source) threshold τ.
-
-## 8. Phase G — graph refinement
-
-Detached. Operates on the predicted-pair graph from Phase F. Closes
-triangles only if `min(p_AB, p_BC) ≥ 0.85` with damping 0.9.
-
-## 9. Phase H — packaging (last)
+### 5c. Tune per-(country, source) thresholds
 
 ```bash
-cd D:/Projects/Amazon_ML/amazon_ml_challenge
-python code/business_entity_resolution/scripts/predict.py
+python scripts/threshold.py
+# Sweeps val set; saves artifacts/per_country_source_threshold.json.
+# Expected output: {"US|S2": ~0.45, "US|S3": ~0.50, "India|S2": ~0.40, "India|S3": ~0.45}.
+```
 
-# Validate:
+### 5d. Train singleton detector (separate small LightGBM)
+
+```bash
+python scripts/singleton_detector.py
+# Aggregates per-S1 features (max P, mean P, count, count > 0.5).
+# Trains separate binary classifier (is_singleton).
+# Writes: artifacts/singleton_classifier.txt.
+```
+
+---
+
+## 6. Phase F — inference on test data
+
+**Test blocker cached** (see §3c). Iterate cheaply:
+
+```bash
+cd code/business_entity_resolution
+
+# ONE-TIME-SETUP (if not already done):
+#   - TRAIN_ONLY=False in src/config.py
+#   - artifacts/s{1,2,3}_norm_test.parquet exist
+#   - artifacts/block_S{2,3}_TEST_features.parquet exist
+
+# Apply model + threshold + singleton to test data:
+python scripts/predict.py
+# Reads: block_S{2,3}_TEST_features.parquet + lgbm_classifier.txt + threshold JSON.
+# Writes: output/matching_results.tsv + output/candidate_pairs.tsv.
+# Wall-clock: 5-10 min per iteration.
+
+# Validate submission format:
 python utils/validate_submission.py \
     --matching output/matching_results.tsv \
     --candidate output/candidate_pairs.tsv \
-    --test-dir dataset/test \
-    --check-ids
+    --test-dir dataset/test --check-ids
+# Exit 0 = submission format OK.
+```
 
-# Package:
+**Key speedup trick**: after the first test-blocker run, every model
+iteration is **5-10 min** — load parquets, LightGBM predict, threshold,
+format. Do NOT re-block on test data unless you change the blocker.
+
+---
+
+## 7. Phase G + H — graph refinement and packaging
+
+(Not yet written; detail to come after Phase F is verified.)
+
+```bash
+# Phase G (post Phase F):
+python scripts/graph_refine.py
+# Closes triangles where min(p_AB, p_BC) ≥ 0.85 with damping 0.9.
+
+# Phase H (final submission):
+python scripts/predict.py  # re-run with refined predictions
+python utils/validate_submission.py ... (same as Phase F)
 zip -r submission.zip output/ code/business_entity_resolution/ Documentation_template.md
 ```
 
-`Documentation_template.md` is at the repo root. Fill from
-`docs/STATUS.md` and the blocker methodology doc.
+---
 
-## Common pitfalls
+## 8. Common pitfalls (recap from STATUS.md)
 
-- **Memory: do NOT spawn multiple Python workers.** The hybrid blocker
-  in `scripts/block_features.py` already keeps RAM ≤ 7.5 GB. If
-  running ad-hoc, keep n_jobs ≤ 4.
-- **Detached: always use `setsid nohup` + log file + done sentinel.**
-  The Claude session timer can otherwise kill jobs that take > 2 min.
-- **Train-only: never `ls dataset/test/` or read those files** during
-  development. They're read-only for Phase H.
-- **Resumability: deleting intermediate files (e.g.
-  `artifacts/_chunks/`) makes the next run rebuild everything.** Don't
-  delete unless you have time.
+- **Polars `.str.split(...)`** on a nullable String column: wrap with `fill_null("")` first.
+- **`str.len_chars().abs().cast(Int32)` overflows**: cast to Int32 BEFORE abs.
+- **Don't `.select(["source1_entity_id"])`** before adding blocking key columns (loses addr_city etc.).
+- **Country hard filter is mandatory**: drop cross-country candidates at probe time.
+- **Quality-tier filter is OR, not AND**: a candidate is kept if it passes at least one of the four floors.
+- **Structural contribution is capped at 3** in composite score (`min(n_struct_keys, 3) / 3`), not 8.
+- **AWS t3.medium is enough for blocking** but NOT for training. Move to a ≥32 GiB box for Phase E.
+
+---
+
+## 9. Memory + time budget (quick reference)
+
+| Stage | Min CPU | Min RAM | Disk | Wall-clock |
+| --- | --- | --- | --- | --- |
+| Phase C v3 (per direction) | 2 vCPU | **8 GiB** | 30 GB | 50-80 min on AWS t3.medium |
+| Phase C2 (combine + validate) | 2 vCPU | 8 GiB | 5 GB | <5 min |
+| Phase E (LightGBM) | 8 cores | **32 GiB** | 50 GB | 3-5 h |
+| Phase F (one-time test block) | 2 vCPU | 8 GiB | +3 GB | ~50 min/direction |
+| Phase F (model iteration) | 2 vCPU | 8 GiB | 0 | 5-10 min |
+| Phase G | 4 cores | 16 GiB | +1 GB | ~15 min |
+| Phase H (packaging) | 2 vCPU | 8 GiB | +1 GB | <5 min |
