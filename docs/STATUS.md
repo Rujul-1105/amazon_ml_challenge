@@ -1,4 +1,4 @@
-# Project STATUS
+    # Project STATUS
 
 Current state of each phase. Update after every milestone. **Future
 sessions: read this file FIRST before doing anything.**
