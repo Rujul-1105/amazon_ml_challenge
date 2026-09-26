@@ -245,35 +245,33 @@ def build_token_index(cand: pl.DataFrame, cap: int) -> dict[str, list[tuple[str,
     return index
 
 
-def build_sorted_neighborhood(cand: pl.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def build_sorted_neighborhood(cand: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Index 3: sorted-token neighborhood.
 
-    Returns (sorted_canon, ids_aligned, countries_aligned) — numpy object arrays
-    of equal length N (one per unique canonical). Sort order in `sorted_canon`
-    is the lexicographic order of canonical_strings; ids_aligned[k] is the cand
-    entity_id that maps to sorted_canon[k].
+    Returns (sorted_canon, ids_aligned) — numpy object arrays of equal length N
+    (one per unique canonical). Sort order in `sorted_canon` is the lexicographic
+    order of canonical_strings; ids_aligned[k] is the cand entity_id that maps
+    to sorted_canon[k]. Country is NOT stored here because we look it up via
+    `cand_dict` in `attach_fields` (avoids 5M wasted numpy entries).
     """
     print(f"[index-3] building sorted-token neighborhood ...", flush=True)
     t0 = time.time()
-    canon_to_entry: dict[str, tuple[str, str]] = {}
+    canon_to_id: dict[str, str] = {}
     for r in cand.iter_rows(named=True):
         text = (r.get("name_clean") or "") + " " + (r.get("addr_clean") or "")
         canon = _canonical_tokens(text)
         # canon may be empty; use a single space placeholder so it sorts but is
-        # effectively unmatchable (and a same-block S1 would still emit its own
-        # entry so we don't accidentally pair S1 with itself).
-        canon_to_entry.setdefault(canon or " ", (r["entity_id"], r.get("country") or ""))
+        # effectively unmatchable. setdefault avoids overwriting if multiple
+        # candidates share the same canonical.
+        canon_to_id.setdefault(canon or " ", r["entity_id"])
 
-    sorted_canon = np.array(sorted(canon_to_entry.keys()), dtype=object)
+    sorted_canon = np.array(sorted(canon_to_id.keys()), dtype=object)
     n = len(sorted_canon)
     ids_aligned = np.empty(n, dtype=object)
-    countries_aligned = np.empty(n, dtype=object)
     for i, c in enumerate(sorted_canon):
-        eid, ctry = canon_to_entry[c]
-        ids_aligned[i] = eid
-        countries_aligned[i] = ctry
+        ids_aligned[i] = canon_to_id[c]
     print(f"        {n:,} unique canonicals in {time.time() - t0:.1f}s", flush=True)
-    return sorted_canon, ids_aligned, countries_aligned
+    return sorted_canon, ids_aligned
 
 
 # ---------------------------------------------------------------------------
@@ -357,10 +355,12 @@ def probe_sorted_neighborhood(chunk: pl.DataFrame, sorted_canon: np.ndarray,
                               ids_aligned: np.ndarray, window: int) -> pl.DataFrame:
     """Probe sorted-token neighborhood per S1; window ±W.
 
-    Returns pair list with `sortedn_rank` = relative rank in [-W, W]\{0},
-    so floor D (sortedn_rank > 0 AND sortedn_rank <= 10) maps directly.
-    rank is the distance (1..window) where 1 = adjacent in sorted order;
-    higher rank = lower lexical similarity.
+    Returns pair list with `sortedn_rank` = |k - idx| distance (1..window) where
+    1 = adjacent in sorted order, higher = lower lexical similarity. The
+    exact-match position (k == idx) is skipped so we don't pair an S1 with a
+    candidate whose canonical is identical (effectively a self-match guard;
+    in practice S1 and S2/S3 are disjoint so the skip is rarely triggered).
+    Floor D in `process_chunk` reads `sortedn_rank > 0 AND sortedn_rank <= 10`.
     """
     s1_rows = chunk.select(["source1_entity_id", "name_clean", "addr_clean"]).to_dicts()
     pairs: list[tuple[str, str, int]] = []
@@ -373,16 +373,11 @@ def probe_sorted_neighborhood(chunk: pl.DataFrame, sorted_canon: np.ndarray,
         idx = int(np.searchsorted(sorted_canon, canon))
         lo = max(0, idx - window)
         hi = min(len(sorted_canon), idx + window + 1)
-        # iterate once over the window, skipping the exact match (self-rank=0)
+        # Walk the ±window; skip the exact-match position; record |k-idx|
         for k in range(lo, hi):
             if k == idx:
                 continue
-            rank = k - idx + window  # 1..2*window, but our window is symmetric so this is fine
-            # Within ±window; the absolute distance from idx is what matters,
-            # but for floor D we want sortedn_rank <= 10, so we translate to
-            # the |k-idx| distance (1..window) instead.
-            dist = abs(k - idx)
-            pairs.append((s1_id, ids_aligned[k], dist))
+            pairs.append((s1_id, ids_aligned[k], abs(k - idx)))
 
     if not pairs:
         return pl.DataFrame(schema={
@@ -438,11 +433,15 @@ def attach_fields(pairs: pl.DataFrame, chunk: pl.DataFrame,
         if s1:
             for k in ["country"] + S1_KEYS_NO_COUNTRY:
                 new["s1_" + k] = s1.get(k)
-        if m:
-            for k in M_KEYS:
-                # m__country, m__name_clean, m__addr_zip, ...
-                prefix = "m__country" if k == "country" else f"m__{k}"
-                new[prefix] = m[k]
+        else:
+            # Defensive: keep s1_* columns populated as None so downstream
+            # filters/expressions don't throw ColumnNotFoundError.
+            for k in ["country"] + S1_KEYS_NO_COUNTRY:
+                new.setdefault("s1_" + k, None)
+        # Always populate m__* keys (None if cand is missing) so the
+        # filter & feature expressions have stable schema.
+        for k in M_KEYS:
+            new["m__" + k] = m[k] if m else None
         out_rows.append(new)
 
     return pl.from_dicts(out_rows, infer_schema_length=10000)
@@ -509,11 +508,13 @@ def compute_polars_features(df: pl.DataFrame) -> pl.DataFrame:
          == pl.col("m__addr_suburb").fill_null("__null__"))
         .cast(pl.Int8).alias("addr_suburb_eq"),
 
-        # 4 missingness flags (passthrough from norm parquet; coerce to Int8)
+        # 4 missingness flags (source columns are m__name_missing/m__addr_missing;
+        # but output alias is single-underscore m_name_missing/m_addr_missing to match
+        # the canonical schema in docs/STATUS.md)
         pl.col("s1_name_missing").cast(pl.Int8).fill_null(0).alias("s1_name_missing"),
-        pl.col("m_name_missing").cast(pl.Int8).fill_null(0).alias("m_name_missing"),
+        pl.col("m__name_missing").cast(pl.Int8).fill_null(0).alias("m_name_missing"),
         pl.col("s1_addr_missing").cast(pl.Int8).fill_null(0).alias("s1_addr_missing"),
-        pl.col("m_addr_missing").cast(pl.Int8).fill_null(0).alias("m_addr_missing"),
+        pl.col("m__addr_missing").cast(pl.Int8).fill_null(0).alias("m_addr_missing"),
     ])
 
 
@@ -612,8 +613,9 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
     # --- Phase 3: attach S1 + M fields (uses cand_dict; ~no extra RAM) ---
     merged = attach_fields(merged, s1_chunk, cand_dict)
 
-    # --- Phase 4: HARD country filter (mandatory; STATUS.md "Hard-fail bugs #5") ---
-    n_before_country = len(merged)
+    # --- Phase 4: HARD country filter (mandatory; STATUS.md "Hard-fail bugs #5").
+    # MUST reassign `merged` — without this, cross-country pairs pass into
+    # Phase E and the LightGBM classifier wastes capacity on easy negatives.
     merged = merged.filter(
         pl.col("s1_country").is_not_null()
         & pl.col("m__country").is_not_null()
@@ -652,6 +654,9 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
 
     # --- Phase 6: composite score (for top-50 tiebreak only) ---
     # struct_score capped at 3 because city/state/country trivially match.
+    # Cast to Float32 explicitly so the parquet column is Float32 (otherwise
+    # the Python float literals would promote the result to Float64, bloating
+    # the column 2× on disk).
     merged = merged.with_columns([
         (
             0.20 * pl.col("n_struct_keys").cast(pl.Float32) / 3.0
@@ -660,7 +665,7 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
             + 0.15 * pl.when(pl.col("sortedn_rank") > 0)
                   .then(1.0 / (1.0 + pl.col("sortedn_rank").cast(pl.Float32)))
                   .otherwise(0.0)
-        ).alias("block_score"),
+        ).cast(pl.Float32).alias("block_score"),
     ])
 
     # --- Phase 7: top-K cap per S1 (default 50; STATUS.md HARD CONSTRAINT) ---
@@ -761,7 +766,7 @@ def main() -> int:
     t0 = time.time()
     inv_struct = build_structural_indexes(cand, cap=args.bucket_cap)
     token_index = build_token_index(cand, cap=args.token_cap)
-    sorted_canon, ids_aligned, _countries_aligned = build_sorted_neighborhood(cand)
+    sorted_canon, ids_aligned = build_sorted_neighborhood(cand)
     print(f"[indexes] all built in {time.time() - t0:.1f}s", flush=True)
 
     # ---- 3. Build cand lookup dict (so attach_fields is O(pairs) not O(N) joins) ----
