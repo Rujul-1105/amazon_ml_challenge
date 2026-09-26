@@ -444,7 +444,11 @@ def attach_fields(pairs: pl.DataFrame, chunk: pl.DataFrame,
             new["m__" + k] = m[k] if m else None
         out_rows.append(new)
 
-    return pl.from_dicts(out_rows, infer_schema_length=10000)
+    # Infer schema from ALL rows (not just first 10000). With the v3 union
+    # of 3 indexes producing ~100k+ pairs per chunk, columns like
+    # addr_house_number can have mixed int/str representations and
+    # infer_schema_length=10000 misses the str-only rows at the tail.
+    return pl.from_dicts(out_rows, infer_schema_length=len(out_rows))
 
 
 def compute_polars_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -743,6 +747,8 @@ def main() -> int:
                    help="Process a 5% slice and skip final concat")
     p.add_argument("--suffix", default=None,
                    help="Output suffix (default: candidate source)")
+    p.add_argument("--start-chunk", type=int, default=-1,
+                   help="Skip chunks with idx < N (default: auto-detect from _chunks/)")
     args = p.parse_args()
 
     candidate_source = args.candidate_source
@@ -792,9 +798,34 @@ def main() -> int:
     args.n_chunks = n_chunks
     print(f"[process] {total:,} s1 entities, {n_chunks} chunks of {args.chunk_size:,}", flush=True)
 
+    # ---- 5a. Resume support: skip chunks already on disk ----
+    existing = set()
+    for f in CHUNK_DIR.glob(f"block_{args.suffix}_*.parquet"):
+        try:
+            idx = int(f.stem.rsplit("_", 1)[-1])
+            existing.add(idx)
+        except ValueError:
+            pass
+
+    if args.start_chunk >= 0:
+        start_chunk = args.start_chunk
+        print(f"[resume] --start-chunk={start_chunk} (explicit override)", flush=True)
+    else:
+        start_chunk = (max(existing) + 1) if existing else 0
+        if existing:
+            print(f"[resume] auto-detected {len(existing):,} existing chunks "
+                  f"(max idx={max(existing):,}); starting at chunk {start_chunk:,}",
+                  flush=True)
+        else:
+            print(f"[resume] no existing chunks found; starting from chunk 0", flush=True)
+
     # ---- 5. Stream chunks ----
     total_pairs = 0
+    skipped = 0
     for i in range(n_chunks):
+        if i < start_chunk or i in existing:
+            skipped += 1
+            continue
         start = i * args.chunk_size
         end = min(start + args.chunk_size, total)
         s1_chunk = s1_slice[start:end]
@@ -805,6 +836,9 @@ def main() -> int:
             cand_dict, args, candidate_source,
         )
         total_pairs += n_pairs
+
+    if skipped:
+        print(f"[resume] skipped {skipped:,} already-on-disk chunks", flush=True)
 
     print(f"[done] {n_chunks} chunks, {total_pairs:,} candidate pairs total", flush=True)
 

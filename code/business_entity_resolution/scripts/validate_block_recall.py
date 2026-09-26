@@ -24,7 +24,9 @@ import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = PROJECT_ROOT / "artifacts"
-DATASET_TRAIN = PROJECT_ROOT / "dataset" / "train"
+# Actual data lives at <repo-root>/dataset/student_resource/dataset/train/
+# (PROJECT_ROOT here = code/business_entity_resolution/, so go up two levels.)
+DATASET_TRAIN = PROJECT_ROOT.parent.parent / "dataset" / "student_resource" / "dataset" / "train"
 
 SEED = 42
 HOLDOUT_FRAC = 0.10
@@ -37,8 +39,11 @@ def load_truth() -> dict[str, set[str]]:
     gt = pl.read_csv(
         DATASET_TRAIN / "train_ground_truth.tsv",
         separator="\t", encoding="utf8-lossy",
-        schema_overrides={"source1_entity_id": pl.Utf8, "matched_entity_ids": pl.Utf8},
     )
+    # The shipped train_ground_truth.tsv has leading whitespace in the header
+    # ("    source1_entity_id"); strip whitespace from column names so the
+    # rest of the script can use clean names.
+    gt = gt.rename({c: c.strip() for c in gt.columns})
     print(f"        {gt.height:,} rows in {time.time() - t0:.1f}s", flush=True)
 
     print("[explode] ground truth pairs ...", flush=True)
