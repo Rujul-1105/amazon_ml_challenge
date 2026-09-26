@@ -479,8 +479,12 @@ def attach_fields(pairs: pl.DataFrame, s1_chunk: pl.DataFrame,
     # so polars' `on=` works without name collision).
     cand_cols = [k for k in M_RENAME.keys() if k != "entity_id"]
     cand_view = cand_df.select(["entity_id"] + cand_cols).rename(M_RENAME)
+    # Note: Polars drops the right key (`_m_join_id`) from the result of an
+    # asymmetric left_on/right_on join by default, so no explicit .drop() is
+    # needed. The placeholder name only exists to avoid a column-name collision
+    # between `pairs.candidate_entity_id` and `cand_view.entity_id` pre-join.
     pairs = pairs.join(cand_view, left_on="candidate_entity_id",
-                       right_on="_m_join_id", how="left").drop("_m_join_id")
+                       right_on="_m_join_id", how="left")
     return pairs
 
 
