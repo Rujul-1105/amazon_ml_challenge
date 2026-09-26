@@ -51,6 +51,7 @@ configure_polars_threads(_RES["polars_threads"])
 import numpy as np
 import polars as pl
 from rapidfuzz import fuzz
+from datasketch import MinHash, MinHashLSH
 
 ARTIFACTS = PROJECT_ROOT / "artifacts"
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
@@ -282,6 +283,69 @@ def build_char_trigram_index(cand: pl.DataFrame, cap: int, include_latin: bool) 
             .with_columns(pl.col("entity_id").list.slice(0, cap))
             .explode("entity_id")
             .rename({"entity_id": "_id"}))
+
+
+def build_minhash_lsh_index(cand: pl.DataFrame, num_perm: int = 64,
+                              threshold: float = 0.5) -> tuple[MinHashLSH, dict[str, MinHash]]:
+    """Real MinHash LSH index on (name_latin + addr_latin) char 3-grams.
+
+    Returns (lsh_index, sigs_dict). sigs_dict maps entity_id → MinHash sig.
+    Used to compute Jaccard-based fuzzy candidates (typos, concatenation, etc).
+
+    Memory: ~1 GB for 10M docs at num_perm=64 (sigs: 10M × 64 bytes = 640 MB;
+    LSH buckets: ~300 MB).
+    """
+    print(f"   [minhash  start] num_perm={num_perm}, threshold={threshold} ...", flush=True)
+    t0 = time.time()
+    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    sigs: dict[str, MinHash] = {}
+    n = 0
+    for row in cand.select(["entity_id", "name_latin", "addr_latin"]).iter_rows(named=True):
+        text = (row.get("name_latin") or "") + " " + (row.get("addr_latin") or "")
+        if len(text) < 3:
+            continue
+        shingles = {text[i:i+3] for i in range(len(text) - 2)}
+        m = MinHash(num_perm=num_perm)
+        for s in shingles:
+            m.update(s.encode("utf-8"))
+        sigs[row["entity_id"]] = m
+        lsh.insert(row["entity_id"], m, check_duplication=False)
+        n += 1
+        if n % 1_000_000 == 0:
+            print(f"      ... {n:,}/{cand.height:,} docs ({time.time()-t0:.1f}s)", flush=True)
+    print(f"   [minhash  done] {n:,} sigs in {time.time()-t0:.1f}s", flush=True)
+    return lsh, sigs
+
+
+def probe_minhash_lsh_subset(s1_chunk: pl.DataFrame, lsh: MinHashLSH,
+                              sigs: dict[str, MinHash],
+                              num_perm: int = 64, threshold: float = 0.5) -> pl.DataFrame:
+    """Query LSH with each S1's MinHash sig. Returns pairs with minhash_jaccard column."""
+    pairs: list[tuple[str, str, float]] = []
+    for row in s1_chunk.select(["source1_entity_id", "name_latin", "addr_latin"]).iter_rows(named=True):
+        text = (row.get("name_latin") or "") + " " + (row.get("addr_latin") or "")
+        if len(text) < 3:
+            continue
+        shingles = {text[i:i+3] for i in range(len(text) - 2)}
+        m = MinHash(num_perm=num_perm)
+        for s in shingles:
+            m.update(s.encode("utf-8"))
+        # Query LSH for candidate matches (band-bucketed, fast)
+        candidates = lsh.query(m)
+        for cand_id in candidates:
+            cand_sig = sigs.get(cand_id)
+            if cand_sig is not None:
+                jac = m.jaccard(cand_sig)
+                if jac >= threshold:
+                    pairs.append((row["source1_entity_id"], cand_id, float(jac)))
+    if not pairs:
+        return pl.DataFrame(schema={
+            "source1_entity_id": pl.Utf8, "candidate_entity_id": pl.Utf8,
+            "minhash_jaccard": pl.Float32,
+        })
+    return pl.DataFrame(pairs,
+                       schema=["source1_entity_id", "candidate_entity_id", "minhash_jaccard"],
+                       orient="row")
 
 
 def build_bigram_index(cand: pl.DataFrame, cap: int, include_latin: bool) -> pl.DataFrame:
@@ -677,7 +741,7 @@ def apply_floor(df: pl.DataFrame, floor_name: str) -> pl.DataFrame:
     elif floor_name == "A_only":
         return df.filter(pl.col("n_struct_keys").fill_null(0) >= 1)
     elif floor_name == "liberal_v3":
-        # liberal_v2 + char-trigram / bigram / edit-distance rescue clauses
+        # liberal_v2 + char-trigram / bigram / edit-distance / minhash rescue clauses
         return df.filter(
             (pl.col("n_struct_keys").fill_null(0) >= 2)
             | (pl.col("n_tokens_shared").fill_null(0) >= 1)
@@ -704,6 +768,7 @@ def apply_floor(df: pl.DataFrame, floor_name: str) -> pl.DataFrame:
             | (pl.col("n_trigrams_shared").fill_null(0) >= 3)
             | (pl.col("n_bigrams_shared").fill_null(0) >= 1)
             | (pl.col("name_ratio").fill_null(0.0) >= 75)
+            | (pl.col("minhash_jaccard").fill_null(0.0) >= 0.5)
         )
     else:
         raise ValueError(f"Unknown floor: {floor_name}")
@@ -785,16 +850,22 @@ METHODS = [
     {"name": "M16_v4_production",        "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v2", "cap": 100},
 
     # M17-M21: aggressive methods targeting typos/concat/cross-script
-    # All use liberal_v3 floor (adds char-trigram / bigram / name_ratio clauses)
+    # All use liberal_v3 floor (adds char-trigram / bigram / name_ratio / minhash clauses)
     # Each method probes a SUBSET of aggressive indices (built lazily)
     # M17 = char-trigram ONLY (MinHash LSH surrogate for short text; Jaccard >=3 in floor)
     # M19 = bigram ONLY
     # M20 = no new probe; just adds name_ratio floor clause (single-char typos)
     # M21 = kitchen sink (char-trigram + bigram + name_ratio floor)
-    {"name": "M17_M16+CharTri",   "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": True, "bigram": False},
-    {"name": "M19_M16+Bigrams",   "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": False, "bigram": True},
-    {"name": "M20_M16+EditDist_floor", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": False, "bigram": False},  # name_ratio floor clause only
-    {"name": "M21_M16+KitchenSink",    "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": True, "bigram": True},  # both + name_ratio floor
+    {"name": "M17_M16+CharTri",   "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": True, "bigram": False, "minhash": False},
+    {"name": "M19_M16+Bigrams",   "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": False, "bigram": True, "minhash": False},
+    {"name": "M20_M16+EditDist_floor", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": False, "bigram": False, "minhash": False},  # name_ratio floor clause only
+    {"name": "M21_M16+KitchenSink",    "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": True, "bigram": True, "minhash": False},  # both + name_ratio floor
+
+    # M22: REAL MinHash LSH (datasketch) on (name_latin + addr_latin) char 3-grams
+    # num_perm=64, threshold=0.5. Adds proper Jaccard-based fuzzy matching.
+    {"name": "M22_M16+RealMinHash", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": False, "bigram": False, "minhash": True},
+    # M23: kitchen sink + real MinHash (everything combined)
+    {"name": "M23_M16+ALL", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": True, "bigram": True, "minhash": True},
 ]
 
 
@@ -804,16 +875,18 @@ METHODS = [
 def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
                gt: dict[str, set[str]],
                cached_inv: dict, cached_token: dict, cached_sortedn: tuple,
-               cached_ct: dict, cached_bigram: dict) -> dict:
+               cached_ct: dict, cached_bigram: dict,
+               cached_minhash: tuple) -> dict:
     """Run one method end-to-end using cached indices."""
     name = method["name"]
     t0 = time.time()
     use_ct = method.get("char_trigram", False)
     use_bigram = method.get("bigram", False)
+    use_minhash = method.get("minhash", False)
     use_latin = method["latin"]
     print(f"\n[{name}] struct_keys={len(method['struct_keys'])} token={method['token']} "
           f"latin={use_latin} sortedn={method['sortedn']} ngram={method['ngram']} "
-          f"ct={use_ct} bigram={use_bigram} floor={method['floor']} cap={method['cap']}",
+          f"ct={use_ct} bigram={use_bigram} mh={use_minhash} floor={method['floor']} cap={method['cap']}",
           flush=True)
 
     # 1. Get cached indices (subset)
@@ -838,6 +911,10 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
         bigram_idx = cached_bigram.get(bigram_cache_key)
     else:
         bigram_idx = None
+    if use_minhash and cached_minhash is not None:
+        mh_lsh, mh_sigs = cached_minhash
+    else:
+        mh_lsh, mh_sigs = None, {}
 
     # 2. Probe 10K S1
     s1_chunk = s1_meta
@@ -851,6 +928,8 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
              if ct_idx is not None else None)
     bigram_df = (probe_bigram_subset(s1_chunk, bigram_idx, top_k=200, include_latin=use_latin)
                  if bigram_idx is not None else None)
+    mh_df = (probe_minhash_lsh_subset(s1_chunk, mh_lsh, mh_sigs)
+             if mh_lsh is not None else None)
 
     # 3. Union (full outer join)
     pairs = struct_df if struct_df is not None else pl.DataFrame(
@@ -868,6 +947,9 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
     if bigram_df is not None:
         pairs = pairs.join(bigram_df, on=["source1_entity_id", "candidate_entity_id"],
                             how="full", coalesce=True)
+    if mh_df is not None:
+        pairs = pairs.join(mh_df, on=["source1_entity_id", "candidate_entity_id"],
+                            how="full", coalesce=True)
     # Ensure all expected columns exist (add zero columns for missing probes).
     # Different methods skip different probes; their columns won't be in pairs.
     for col_name, dtype in [
@@ -876,6 +958,7 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
         ("sortedn_rank", pl.Int16),
         ("n_trigrams_shared", pl.Int16),
         ("n_bigrams_shared", pl.Int16),
+        ("minhash_jaccard", pl.Float32),
     ]:
         if col_name not in pairs.columns:
             pairs = pairs.with_columns(pl.lit(0).cast(dtype).alias(col_name))
@@ -885,6 +968,7 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
         pl.col("sortedn_rank").fill_null(0).cast(pl.Int16),
         pl.col("n_trigrams_shared").fill_null(0).cast(pl.Int16),
         pl.col("n_bigrams_shared").fill_null(0).cast(pl.Int16),
+        pl.col("minhash_jaccard").fill_null(0.0).cast(pl.Float32),
     ])
     n_after_probe = pairs.height
 
@@ -922,6 +1006,8 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
             + 0.15 * pl.when(pl.col("sortedn_rank").fill_null(0) > 0)
                   .then(1.0 / (1.0 + pl.col("sortedn_rank").cast(pl.Float32)))
                   .otherwise(0.0)
+            # Add minhash boost: if real MinHash caught this pair, boost score
+            + 0.10 * (pl.col("minhash_jaccard").fill_null(0.0) > 0).cast(pl.Float32)
         ).cast(pl.Float32).alias("block_score"),
     ])
 
@@ -942,7 +1028,7 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
           f"cands/S1={metrics['mean_cands']:.1f}  ({elapsed:.1f}s)", flush=True)
 
     # Cleanup per-method intermediates
-    del struct_df, token_df, sn_df, ct_df, bigram_df, pairs, inv_subset
+    del struct_df, token_df, sn_df, ct_df, bigram_df, mh_df, pairs, inv_subset
     if token_idx is not None:
         del token_idx
     if ct_idx is not None:
@@ -956,7 +1042,7 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
         "struct_keys": str(len(method["struct_keys"])),
         "token": method["token"], "latin": method["latin"],
         "sortedn": method["sortedn"], "ngram": method["ngram"],
-        "char_trigram": use_ct, "bigram": use_bigram,
+        "char_trigram": use_ct, "bigram": use_bigram, "minhash": use_minhash,
         "floor": method["floor"], "cap": method["cap"],
         **metrics,
         "n_cands": n_cands,
@@ -1094,6 +1180,15 @@ def main() -> int:
               flush=True)
         log_resources("after-bigram")
 
+    # 3c. Build real MinHash LSH index (lazy — only if any method needs it)
+    # datasketch MinHash with num_perm=64, threshold=0.5. Slowest index but most accurate.
+    cached_minhash: tuple = ()
+    any_method_needs_minhash = any(m.get("minhash", False) for m in methods_to_run)
+    if any_method_needs_minhash:
+        log_resources("pre-minhash")
+        cached_minhash = build_minhash_lsh_index(cand_df, num_perm=64, threshold=0.5)
+        log_resources("after-minhash")
+
     # 4. Run all methods using cached indices
     print("\n" + "=" * 70, flush=True)
     print(f"Running {len(METHODS)} methods on {s1_meta.height:,} S1 ...", flush=True)
@@ -1104,7 +1199,7 @@ def main() -> int:
         try:
             row = run_method(method, s1_meta, cand_df, gt,
                              cached_inv, cached_token, cached_sortedn,
-                             cached_ct, cached_bigram)
+                             cached_ct, cached_bigram, cached_minhash)
             results.append(row)
         except Exception as e:
             print(f"   ERROR: {type(e).__name__}: {e}", flush=True)
@@ -1122,7 +1217,7 @@ def main() -> int:
             log_resources(f"after-method-{i}")
 
     # Free cached indices
-    del cached_inv, cached_token, cached_sortedn, cand_df
+    del cached_inv, cached_token, cached_sortedn, cached_minhash, cand_df
     gc.collect()
 
     # Write CSV
