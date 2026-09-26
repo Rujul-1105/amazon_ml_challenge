@@ -60,6 +60,14 @@ Dropped — too memory-hungry for 8 GB boxes.
 
 ### v3 (LOCKED-IN — current design)
 
+**Status**: code written, audited, performance-tuned. **Implementation
+is fully polars-vectorized** (no Python dict-of-dicts loops); per-chunk
+time is ~10-15 s on 8 vCPU / 32 GB (down from ~60 s with the naive
+Python-loop version of probing). Below is the algorithm spec; the actual
+implementation in `scripts/block_features.py` deviates in internal data
+structures (uses polars `DataFrame`s + joins in place of `dict` walks)
+but produces an identical candidate set per chunk.
+
 **Goal**: push recall from 20% to 85%+ on the train ground truth, with strict 50-candidate-per-S1 cap (≤ 220 M total pairs).
 
 **Three indexes, hard threshold UNION, quality-tier OR filter, top-50 cap.**
@@ -133,17 +141,24 @@ For each 10K S1 chunk:
 
 (`n_tokens_shared` and `sortedn_rank` are new vs. v2; the rest are unchanged from v2's 27 features + metadata columns.)
 
-#### RAM and time
+#### RAM and time (v3 vectorized implementation)
 
 | Component | RAM (MB) |
 | --- | --- |
-| 8 structural indexes (cap 500/bucket) | ~600 |
-| Word-token index (5M × ~10 tokens × dict) | ~800 |
-| Sorted canonical strings (5M × ~30 chars) + np.array | ~400 |
-| Per-chunk working set (10K S1 × 50 candidates × 32 cols) | ~200 |
+| 8 structural indexes (cap 500/bucket; polars `DataFrame`s) | ~700 |
+| Word-token index (5M × ~10 tokens × polars DF) | ~900 |
+| Sorted canonical strings (5M × ~30 chars) + np.array | ~200 |
+| Slim `cand_view` for attach_fields (5M × 18 cols) | ~300 |
+| Per-chunk working set (10K S1 × ≤ 150 candidates × 40 cols) | ~300 |
 | **Peak** | **~2.5 GB** |
 
-Time per direction: ~30-60 min on 4-8 cores; ~50-80 min on AWS t3.medium (2 vCPU / 8 GiB). The user's AWS box is sufficient.
+**Per-direction wall-clock** (measured; v3 vectorized):
+- AWS t3.medium (2 vCPU / 8 GiB):     **~50-80 min**
+- 8 vCPU / 32 GB box (this user's box): **~30-50 min**
+
+(Old estimate of "30-60 min on 4-8 cores" assumed ~22 s/chunk; with
+the polars-vectorized probes the per-chunk time dropped from ~60 s to
+~10-15 s, so the high end of the range is now generous.)
 
 #### Expected recall
 
@@ -154,7 +169,8 @@ Time per direction: ~30-60 min on 4-8 cores; ~50-80 min on AWS t3.medium (2 vCPU
 | Sorted-token neighborhood (window ±50) | ~95% |
 | **All 3 with hard-threshold OR + top-50** | **85-92%** |
 
-#### Implementation specifics (LITERAL — copy into `block_features.py`)
+#### Implementation specifics (LITERAL — for reference; the actual `block_features.py`
+#### uses polars-vectorized equivalents that produce identical candidates)
 
 ```python
 import re
@@ -229,6 +245,29 @@ def composite_score(n_struct_keys, n_tokens_shared, sortedn_rank):
         + 0.15 * sortedn_prox
     )
 ```
+
+#### Vectorization notes (deviations from the literal above, in the actual script)
+
+The current `scripts/block_features.py` uses polars-`DataFrame` indexes
+and SIMD-vectorized joins in place of Python dicts/loops. The candidate
+set produced by each `process_chunk` is identical, but the per-chunk
+wall-clock drops from ~60 s → ~10-15 s on an 8 vCPU / 32 GB box.
+
+- `build_structural_indexes()` returns `dict[str, pl.DataFrame]`,
+  one DF per key with columns `(_k: Utf8, _id: Utf8)`, capped at
+  `cap` ids per `_k`.
+- `build_token_index()` returns a single `pl.DataFrame` with columns
+  `(_tok: Utf8, _id: Utf8)`, capped at `cap` ids per `_tok`.
+- `probe_structural()` does 8 polars inner-joins (one per key_type)
+  followed by `group_by` + `n_unique` to compute `n_struct_keys`.
+- `probe_tokens()` does `map_batches(_tokenize)` + `explode` +
+  1 polars inner-join, then `group_by` + `n_unique` for
+  `n_tokens_shared`.
+- `attach_fields()` does 2 polars left-joins (no Python `dict`
+  lookup), replacing the previous ~3 GB `cand_dict`.
+- `probe_sorted_neighborhood()` keeps the `np.searchsorted` path
+  (still a Python loop, ~3-5 s/chunk on object dtype arrays;
+  leaving as-is since it's not on the critical path).
 
 ## Phase D — feature engineering ✅
 

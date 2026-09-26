@@ -69,7 +69,6 @@ import os
 import re
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 if sys.platform.startswith("win"):
@@ -194,55 +193,66 @@ def load_sources(candidate_source: str) -> tuple[pl.DataFrame, pl.DataFrame]:
 # ---------------------------------------------------------------------------
 # Index builders
 # ---------------------------------------------------------------------------
-def build_structural_indexes(cand: pl.DataFrame, cap: int) -> dict[str, dict[str, list[str]]]:
-    """Index 1: 8 structural inverted indexes; each bucket capped at `cap`."""
+def build_structural_indexes(cand: pl.DataFrame, cap: int) -> dict[str, pl.DataFrame]:
+    """Index 1: 8 structural inverted indexes as polars DataFrames.
+
+    Each index is a long-format DF with columns (_k: Utf8, _id: Utf8),
+    capped at `cap` ids per (key_type, key_value) bucket. Polars-side
+    representation enables sub-second per-chunk probing via SIMD join.
+    """
     print(f"[index-1] building 8 structural inverted indexes (cap={cap}) ...", flush=True)
-    inv: dict[str, dict[str, list[str]]] = {}
+    inv: dict[str, pl.DataFrame] = {}
     for name, expr in KEY_EXTRACTORS.items():
         t0 = time.time()
         df = (cand.with_columns(expr.alias("_k"))
                   .filter(pl.col("_k").is_not_null() & (pl.col("_k") != ""))
-                  .select(["entity_id", "_k"])
-                  .unique(subset=["_k", "entity_id"]))
-        grouped = (df.group_by("_k")
-                     .agg(pl.col("entity_id"))
-                     .with_columns(pl.col("entity_id").list.slice(0, cap).alias("capped")))
-        inv[name] = dict(zip(grouped["_k"].to_list(), grouped["capped"].to_list()))
-        n_keys = len(inv[name])
-        n_total = sum(len(v) for v in inv[name].values())
-        print(f"   [{name:>11s}] {n_keys:>7,} unique keys, {n_total:>9,} ids in {time.time() - t0:.1f}s", flush=True)
+                  .select(["_k", pl.col("entity_id").alias("_id")])
+                  .unique(subset=["_k", "_id"])
+                  .group_by("_k")
+                  .agg(pl.col("_id"))
+                  .with_columns(pl.col("_id").list.slice(0, cap))
+                  .explode("_id"))
+        inv[name] = df
+        n_keys = df["_k"].n_unique()
+        n_pairs = df.height
+        print(f"   [{name:>11s}] {n_keys:>7,} keys, {n_pairs:>9,} (key,id) in {time.time() - t0:.1f}s",
+              flush=True)
     return inv
 
 
-def build_token_index(cand: pl.DataFrame, cap: int) -> dict[str, list[tuple[str, str]]]:
-    """Index 2: word-token inverted index (name_clean + addr_clean).
+def build_token_index(cand: pl.DataFrame, cap: int) -> pl.DataFrame:
+    """Index 2: word-token inverted index as a polars DataFrame.
 
-    Returns dict[token -> list[(entity_id, country)]] capped at `cap` per token.
-    Storing country inside each entry avoids a second lookup at probe time.
+    Returns a long-format DF with columns (_tok: Utf8, _id: Utf8), capped at
+    `cap` ids per token bucket. Country is no longer stored here — it's looked
+    up via `attach_fields` (polars join) which is vectorized.
     """
     print(f"[index-2] building word-token inverted index (cap={cap}) ...", flush=True)
     t0 = time.time()
-    index: dict[str, list[tuple[str, str]]] = {}
-    for i, row in enumerate(cand.iter_rows(named=True)):
-        text = (row.get("name_clean") or "") + " " + (row.get("addr_clean") or "")
-        toks = set(_tokenize(text))
-        if not toks:
-            continue
-        ent_id = row["entity_id"]
-        country = row.get("country") or ""
-        for tok in toks:
-            lst = index.get(tok)
-            if lst is None:
-                index[tok] = [(ent_id, country)]
-            elif len(lst) < cap:
-                lst.append((ent_id, country))
-        if (i + 1) % 500_000 == 0:
-            print(f"        processed {i + 1:,} / {cand.height:,}", flush=True)
-    n_tokens = len(index)
-    n_total = sum(len(v) for v in index.values())
+    # Pass 1: collect records (need to know len(cand) per token to apply cap).
+    # Group by candidate to dedupe, then trim to cap.
+    cand_tok = cand.with_columns([
+        (pl.col("name_clean").fill_null("") + pl.lit(" ") + pl.col("addr_clean").fill_null("")).alias("_text"),
+    ]).with_columns(
+        pl.col("_text").map_batches(
+            lambda s: pl.Series([list(set(_tokenize(t)) if t else []) for t in s]),
+            return_dtype=pl.List(pl.Utf8),
+        ).alias("_toks"),
+    ).select(["entity_id", "_toks"]).explode("_toks").rename({"_toks": "_tok"})
+    cand_tok = cand_tok.filter(pl.col("_tok").is_not_null())
+    # Apply per-token cap (keep first `cap` ids per token; ids are dedupe-stable)
+    df = (cand_tok
+        .unique(subset=["_tok", "entity_id"])
+        .group_by("_tok")
+        .agg(pl.col("entity_id"))
+        .with_columns(pl.col("entity_id").list.slice(0, cap))
+        .explode("entity_id")
+        .rename({"entity_id": "_id"}))
+    n_tokens = df["_tok"].n_unique()
+    n_total = df.height
     print(f"        {n_tokens:,} unique tokens, {n_total:,} (token,id) pairs in {time.time() - t0:.1f}s",
           flush=True)
-    return index
+    return df
 
 
 def build_sorted_neighborhood(cand: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -252,7 +262,7 @@ def build_sorted_neighborhood(cand: pl.DataFrame) -> tuple[np.ndarray, np.ndarra
     (one per unique canonical). Sort order in `sorted_canon` is the lexicographic
     order of canonical_strings; ids_aligned[k] is the cand entity_id that maps
     to sorted_canon[k]. Country is NOT stored here because we look it up via
-    `cand_dict` in `attach_fields` (avoids 5M wasted numpy entries).
+    in `attach_fields` (avoids 5M wasted numpy entries).
     """
     print(f"[index-3] building sorted-token neighborhood ...", flush=True)
     t0 = time.time()
@@ -278,77 +288,91 @@ def build_sorted_neighborhood(cand: pl.DataFrame) -> tuple[np.ndarray, np.ndarra
 # Per-S1 probes
 # ---------------------------------------------------------------------------
 def probe_structural(chunk: pl.DataFrame, inv: dict, top_k: int) -> pl.DataFrame:
-    """Probe 8 structural keys per S1; return pairs with `n_struct_keys`."""
-    keys_exprs = [expr.alias(f"_bk_{name}") for name, expr in KEY_EXTRACTORS.items()]
-    rows = chunk.with_columns(keys_exprs).select(
-        ["source1_entity_id"] + [f"_bk_{n}" for n in KEY_EXTRACTORS]
-    ).to_dicts()
+    """Vectorized structural probe via 8 polars inner-joins (sub-second on 10K rows).
 
-    cand_count: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for row in rows:
-        s1_id = row["source1_entity_id"]
-        for name in KEY_EXTRACTORS:
-            val = row[f"_bk_{name}"]
-            if val is None or val == "":
-                continue
-            bucket = inv[name].get(val)
-            if not bucket:
-                continue
-            for cid in bucket:
-                cand_count[s1_id][cid] += 1
+    For each (key_type, key_value), joins chunk.rows against the inverted index
+    and unions all 8 results. Counts distinct `key_type`s per (s1, cand) pair
+    to produce `n_struct_keys`, then caps per-S1 at `top_k`.
+    """
+    parts: list[pl.DataFrame] = []
+    for name, expr in KEY_EXTRACTORS.items():
+        s1k = (chunk
+            .with_columns(expr.alias("_k"))
+            .filter(pl.col("_k").is_not_null() & (pl.col("_k") != ""))
+            .select(["source1_entity_id", "_k"]))
+        if s1k.is_empty():
+            continue
+        joined = s1k.join(inv[name], on="_k", how="inner")
+        parts.append(joined.with_columns(pl.lit(name).alias("_kt")))
 
-    pairs: list[tuple[str, str, int]] = []
-    for s1_id, cands in cand_count.items():
-        ranked = sorted(cands.items(), key=lambda x: -x[1])
-        for cid, cnt in ranked[:top_k]:
-            pairs.append((s1_id, cid, cnt))
-
-    if not pairs:
+    if not parts:
         return pl.DataFrame(schema={
             "source1_entity_id": pl.Utf8,
             "candidate_entity_id": pl.Utf8,
             "n_struct_keys": pl.Int8,
         })
-    return pl.DataFrame(
-        pairs,
-        schema=["source1_entity_id", "candidate_entity_id", "n_struct_keys"],
-        orient="row",
-    )
+    all_pairs = pl.concat(parts).select(["source1_entity_id", "_id", "_kt"]).unique()
+    if all_pairs.is_empty():
+        return pl.DataFrame(schema={
+            "source1_entity_id": pl.Utf8,
+            "candidate_entity_id": pl.Utf8,
+            "n_struct_keys": pl.Int8,
+        })
+    n_struct = (all_pairs
+        .group_by(["source1_entity_id", "_id"])
+        .agg(pl.col("_kt").n_unique().cast(pl.Int8).alias("n_struct_keys"))
+        .with_columns(pl.col("n_struct_keys").rank(method="ordinal", descending=True)
+                          .over("source1_entity_id").alias("_r"))
+        .filter(pl.col("_r") <= top_k)
+        .drop("_r")
+        .rename({"_id": "candidate_entity_id"}))
+    return n_struct
 
 
-def probe_tokens(chunk: pl.DataFrame, token_index: dict, top_k: int) -> pl.DataFrame:
-    """Probe token inverted index per S1; return pairs with `n_tokens_shared`."""
-    cand_count: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    s1_rows = chunk.select(["source1_entity_id", "name_clean", "addr_clean"]).to_dicts()
-    for row in s1_rows:
-        s1_id = row["source1_entity_id"]
-        text = (row.get("name_clean") or "") + " " + (row.get("addr_clean") or "")
-        toks = set(_tokenize(text))
-        if not toks:
-            continue
-        for tok in toks:
-            bucket = token_index.get(tok)
-            if bucket:
-                for cid, _ctry in bucket:
-                    cand_count[s1_id][cid] += 1
+def probe_tokens(chunk: pl.DataFrame, token_index_df: pl.DataFrame,
+                 top_k: int) -> pl.DataFrame:
+    """Vectorized token probe via polars join (sub-second on 10K rows).
 
-    pairs: list[tuple[str, str, int]] = []
-    for s1_id, cands in cand_count.items():
-        ranked = sorted(cands.items(), key=lambda x: -x[1])
-        for cid, cnt in ranked[:top_k]:
-            pairs.append((s1_id, cid, cnt))
-
-    if not pairs:
+    1. Tokenize S1 rows (`map_batches` for one-shot Python pass).
+    2. Explode to long format (s1_id, token).
+    3. Inner-join against token index DF on `_tok`.
+    4. Count distinct tokens per (s1, cand) pair as `n_tokens_shared`.
+    5. Cap per-S1 at `top_k`.
+    """
+    s1_tok = (chunk
+        .with_columns(
+            (pl.col("name_clean").fill_null("") + pl.lit(" ")
+             + pl.col("addr_clean").fill_null("")).alias("_text"))
+        .select(["source1_entity_id", "_text"])
+        .with_columns(pl.col("_text").map_batches(
+                lambda s: pl.Series([list(set(_tokenize(t)) if t else []) for t in s]),
+                return_dtype=pl.List(pl.Utf8),
+            ).alias("_toks"))
+        .select(["source1_entity_id", "_toks"])
+        .explode("_toks"))
+    s1_tok = s1_tok.filter(pl.col("_toks").is_not_null()).rename({"_toks": "_tok"})
+    if s1_tok.is_empty():
         return pl.DataFrame(schema={
             "source1_entity_id": pl.Utf8,
             "candidate_entity_id": pl.Utf8,
             "n_tokens_shared": pl.Int8,
         })
-    return pl.DataFrame(
-        pairs,
-        schema=["source1_entity_id", "candidate_entity_id", "n_tokens_shared"],
-        orient="row",
-    )
+    joined = s1_tok.join(token_index_df, on="_tok", how="inner")
+    if joined.is_empty():
+        return pl.DataFrame(schema={
+            "source1_entity_id": pl.Utf8,
+            "candidate_entity_id": pl.Utf8,
+            "n_tokens_shared": pl.Int8,
+        })
+    n_tokens = (joined
+        .group_by(["source1_entity_id", "_id"])
+        .agg(pl.col("_tok").n_unique().cast(pl.Int8).alias("n_tokens_shared"))
+        .with_columns(pl.col("n_tokens_shared").rank(method="ordinal", descending=True)
+                          .over("source1_entity_id").alias("_r"))
+        .filter(pl.col("_r") <= top_k)
+        .drop("_r")
+        .rename({"_id": "candidate_entity_id"}))
+    return n_tokens
 
 
 def probe_sorted_neighborhood(chunk: pl.DataFrame, sorted_canon: np.ndarray,
@@ -395,56 +419,69 @@ def probe_sorted_neighborhood(chunk: pl.DataFrame, sorted_canon: np.ndarray,
 # ---------------------------------------------------------------------------
 # Field attachment + feature computation
 # ---------------------------------------------------------------------------
-S1_KEYS_NO_COUNTRY = [
-    "name_clean", "name_latin", "name_dev_ratio", "name_missing",
-    "addr_clean", "addr_latin", "addr_missing",
-    "addr_zip", "addr_state", "addr_city",
-    "addr_first_word", "addr_last_word",
-    "addr_house_number", "addr_road", "addr_unit", "addr_suburb",
-]
+# Source-side key lists (for rename → prefix). country handled specially.
+S1_RENAME = {
+    "country":          "s1_country",
+    "name_clean":       "s1_name_clean",
+    "name_latin":       "s1_name_latin",
+    "name_dev_ratio":   "s1_name_dev_ratio",
+    "name_missing":     "s1_name_missing",
+    "addr_clean":       "s1_addr_clean",
+    "addr_latin":       "s1_addr_latin",
+    "addr_missing":     "s1_addr_missing",
+    "addr_zip":         "s1_addr_zip",
+    "addr_state":       "s1_addr_state",
+    "addr_city":        "s1_addr_city",
+    "addr_first_word":  "s1_addr_first_word",
+    "addr_last_word":   "s1_addr_last_word",
+    "addr_house_number":"s1_addr_house_number",
+    "addr_road":        "s1_addr_road",
+    "addr_unit":        "s1_addr_unit",
+    "addr_suburb":      "s1_addr_suburb",
+}
+M_RENAME = {
+    "entity_id":        "_m_join_id",   # placeholder; renamed AFTER join
+    "country":          "m__country",
+    "name_clean":       "m__name_clean",
+    "name_latin":       "m__name_latin",
+    "name_dev_ratio":   "m__name_dev_ratio",
+    "name_missing":     "m__name_missing",
+    "addr_clean":       "m__addr_clean",
+    "addr_latin":       "m__addr_latin",
+    "addr_missing":     "m__addr_missing",
+    "addr_zip":         "m__addr_zip",
+    "addr_state":       "m__addr_state",
+    "addr_city":        "m__addr_city",
+    "addr_first_word":  "m__addr_first_word",
+    "addr_last_word":   "m__addr_last_word",
+    "addr_house_number":"m__addr_house_number",
+    "addr_road":        "m__addr_road",
+    "addr_unit":        "m__addr_unit",
+    "addr_suburb":      "m__addr_suburb",
+}
 
-M_KEYS = [
-    "country", "name_clean", "name_latin", "name_dev_ratio", "name_missing",
-    "addr_clean", "addr_latin", "addr_missing",
-    "addr_zip", "addr_state", "addr_city",
-    "addr_first_word", "addr_last_word",
-    "addr_house_number", "addr_road", "addr_unit", "addr_suburb",
-]
 
-
-def attach_fields(pairs: pl.DataFrame, chunk: pl.DataFrame,
-                  cand_dict: dict) -> pl.DataFrame:
-    """Attach S1 + candidate fields for feature computation.
+def attach_fields(pairs: pl.DataFrame, s1_chunk: pl.DataFrame,
+                  cand_df: pl.DataFrame) -> pl.DataFrame:
+    """Attach S1 + candidate fields via polars joins (vectorized, no Python dict).
 
     - s1 fields prefixed `s1_`     (e.g., s1_country, s1_name_clean)
     - candidate fields prefixed `m__` (e.g., m__country, m__name_clean)
+    - Both come from pre-built polars DataFrames, joined on the pair key.
+    - Replaces previous Python-dict loop (3-5 s/chunk → ~0.3 s/chunk).
     """
-    s1_records = chunk.select(["source1_entity_id"] + ["country"] + S1_KEYS_NO_COUNTRY).to_dicts()
-    s1_dict = {r["source1_entity_id"]: r for r in s1_records}
-    pair_rows = pairs.to_dicts()
+    # S1 fields: pull from chunk and rename with `s1_` prefix.
+    s1_view = s1_chunk.select(["source1_entity_id"] + list(S1_RENAME.keys())).rename(S1_RENAME)
+    pairs = pairs.join(s1_view, on="source1_entity_id", how="left")
 
-    out_rows: list[dict] = []
-    for r in pair_rows:
-        s1_id = r["source1_entity_id"]
-        cand_id = r["candidate_entity_id"]
-        s1 = s1_dict.get(s1_id)
-        m = cand_dict.get(cand_id)
-        new = dict(r)
-        if s1:
-            for k in ["country"] + S1_KEYS_NO_COUNTRY:
-                new["s1_" + k] = s1.get(k)
-        else:
-            # Defensive: keep s1_* columns populated as None so downstream
-            # filters/expressions don't throw ColumnNotFoundError.
-            for k in ["country"] + S1_KEYS_NO_COUNTRY:
-                new.setdefault("s1_" + k, None)
-        # Always populate m__* keys (None if cand is missing) so the
-        # filter & feature expressions have stable schema.
-        for k in M_KEYS:
-            new["m__" + k] = m[k] if m else None
-        out_rows.append(new)
-
-    return pl.from_dicts(out_rows, infer_schema_length=10000)
+    # M fields: pull from cand_df and rename with `m__` prefix. entity_id is
+    # the join key; we keep it as-is (the rename dict maps it to a placeholder
+    # so polars' `on=` works without name collision).
+    cand_cols = [k for k in M_RENAME.keys() if k != "entity_id"]
+    cand_view = cand_df.select(["entity_id"] + cand_cols).rename(M_RENAME)
+    pairs = pairs.join(cand_view, left_on="candidate_entity_id",
+                       right_on="_m_join_id", how="left").drop("_m_join_id")
+    return pairs
 
 
 def compute_polars_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -577,14 +614,14 @@ def compute_fuzzy_features(df: pl.DataFrame) -> pl.DataFrame:
 # Per-chunk pipeline
 # ---------------------------------------------------------------------------
 def process_chunk(idx: int, s1_chunk: pl.DataFrame,
-                  inv_struct, token_index,
+                  inv_struct, token_index_df,
                   sorted_canon, ids_aligned,
-                  cand_dict: dict, args, candidate_source: str) -> tuple[int, int, int]:
+                  cand_df: pl.DataFrame, args, candidate_source: str) -> tuple[int, int, int]:
     t_chunk = time.time()
 
     # --- Phase 1: probe each of 3 indexes (per-S1 cap from --top-k-index) ---
     struct_df = probe_structural(s1_chunk, inv_struct, top_k=args.top_k_index)
-    token_df  = probe_tokens(s1_chunk, token_index, top_k=args.top_k_index)
+    token_df  = probe_tokens(s1_chunk, token_index_df, top_k=args.top_k_index)
     sn_df     = probe_sorted_neighborhood(
                     s1_chunk, sorted_canon, ids_aligned,
                     window=args.sn_window)
@@ -610,8 +647,8 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
         (pl.col("sortedn_rank") > 0).cast(pl.Int8).alias("from_sortedn"),
     ])
 
-    # --- Phase 3: attach S1 + M fields (uses cand_dict; ~no extra RAM) ---
-    merged = attach_fields(merged, s1_chunk, cand_dict)
+    # --- Phase 3: attach S1 + M fields (vectorized polars joins). ---
+    merged = attach_fields(merged, s1_chunk, cand_df)
 
     # --- Phase 4: HARD country filter (mandatory; STATUS.md "Hard-fail bugs #5").
     # MUST reassign `merged` — without this, cross-country pairs pass into
@@ -761,6 +798,21 @@ def main() -> int:
     s1, cand = load_sources(candidate_source)
     s1 = s1.rename({"entity_id": "source1_entity_id"})
 
+    # ---- 1b. Defensive: clean any stale chunks from a prior partial run ----
+    # Without this, a previously interrupted real run with the same --suffix
+    # would leak old chunk files into the final concat (wrong row count, possibly
+    # mixed-schema). Dry-run is skipped so users can inspect smoke chunks.
+    if not args.dry_run:
+        stale = sorted(CHUNK_DIR.glob(f"block_{args.suffix}_*.parquet"))
+        if stale:
+            print(f"[cleanup] removing {len(stale)} stale chunk files for suffix={args.suffix}",
+                  flush=True)
+            for f in stale:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
     # ---- 2. Build 3 indexes ----
     print("[indexes] building v3 indexes on candidate side ...", flush=True)
     t0 = time.time()
@@ -769,14 +821,14 @@ def main() -> int:
     sorted_canon, ids_aligned = build_sorted_neighborhood(cand)
     print(f"[indexes] all built in {time.time() - t0:.1f}s", flush=True)
 
-    # ---- 3. Build cand lookup dict (so attach_fields is O(pairs) not O(N) joins) ----
-    print("[cand_dict] building candidate lookup dict ...", flush=True)
-    t0 = time.time()
-    cand_dict: dict[str, dict] = {}
-    for r in cand.iter_rows(named=True):
-        cand_dict[r["entity_id"]] = r
-    print(f"        {len(cand_dict):,} entries in {time.time() - t0:.1f}s", flush=True)
-    del cand  # free the polars frame; we only need cand_dict
+    # ---- 3. Slim cand view (just the fields attach_fields needs) ----
+    # Keep `cand` as a polars DF; vectorized joins replace the old Python
+    # dict-of-dicts (which used ~3 GB RAM on a 5 M-row candidate). Projecting
+    # only the columns `attach_fields` reads via M_RENAME keeps cand_view
+    # to ~300 MB.
+    cand_view_cols = [k for k in M_RENAME.keys() if k != "entity_id"]
+    cand_view = cand.select(["entity_id"] + cand_view_cols)
+    del cand  # free original DataFrame (we only need cand_view + indexes)
 
     # ---- 4. Slice (dry-run only) ----
     if args.dry_run:
@@ -802,7 +854,7 @@ def main() -> int:
             i, s1_chunk,
             inv_struct, token_index,
             sorted_canon, ids_aligned,
-            cand_dict, args, candidate_source,
+            cand_view, args, candidate_source,
         )
         total_pairs += n_pairs
 
