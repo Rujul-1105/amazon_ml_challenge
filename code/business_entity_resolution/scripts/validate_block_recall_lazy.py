@@ -98,9 +98,9 @@ def main() -> int:
     # ---- 2. Lazy union of block predictions, dedup to (s1_id, cand_id) ----
     print(f"[scan] {len(args.blocks)} block parquet(s) ...", flush=True)
     block_lfs = [
-        pl.scan_parquet(path, include_file_paths=False)
+        pl.scan_parquet(path)
           .select("source1_entity_id", "candidate_entity_id")
-          for path in args.blocks
+        for path in args.blocks
     ]
     pred_lf = pl.concat(block_lfs, how="vertical_relaxed").unique(
         subset=["source1_entity_id", "candidate_entity_id"]
@@ -116,7 +116,7 @@ def main() -> int:
     holdout_with_country = holdout_frame.join(
         all_s1.rename({"entity_id": "source1_entity_id"}),
         on="source1_entity_id", how="left",
-    )
+    ).lazy()
 
     cand_per_s1 = (
         holdout_with_country
@@ -128,14 +128,14 @@ def main() -> int:
 
     # True matches per S1 (from ground truth)
     true_per_s1 = (
-        truth_pairs
+        truth_pairs.lazy()
         .filter(pl.col("source1_entity_id").is_in(holdout_set))
         .group_by("source1_entity_id")
         .agg(pl.col("matched_id").n_unique().alias("n_true"))
     )
 
     # Hits per S1: join truth on (s1, matched == candidate) inside the holdout
-    truth_in_holdout = truth_pairs.filter(pl.col("source1_entity_id").is_in(holdout_set))
+    truth_in_holdout = truth_pairs.lazy().filter(pl.col("source1_entity_id").is_in(holdout_set))
     hits_per_s1 = (
         truth_in_holdout
         .rename({"matched_id": "candidate_entity_id"})
@@ -146,9 +146,7 @@ def main() -> int:
 
     # ---- 4. Stitch together, compute recall ----
     recall_lf = (
-        pl.concat([
-            holdout_with_country.select("source1_entity_id", "country"),
-        ], how="vertical")
+        holdout_with_country.select("source1_entity_id", "country")
         .join(cand_per_s1, on="source1_entity_id", how="left")
         .join(true_per_s1, on="source1_entity_id", how="left")
         .join(hits_per_s1, on="source1_entity_id", how="left")
