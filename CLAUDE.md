@@ -20,12 +20,21 @@ Full problem statement: `data_set/student_resource/README.md` (canonical) and `p
 |---|---|---|
 | A — env / packages | ✅ done | — |
 | B — normalization (libpostal `parse_address`) | ✅ done | `code/business_entity_resolution/artifacts/s{1,2,3}_norm_train.parquet` (~1.3 GB) |
-| **C — blocking** | ⏸ **resume here** | missing 4 `artifacts/blocks_country=*_source=*.parquet` files |
-| D — feature engineering | ⏸ pending | — |
+| **C — blocking** | 🔄 **in progress (S2 running, smoke test passed)** | per-chunk parquets in `code/business_entity_resolution/artifacts/_chunks/`; final `block_S2_features.parquet` produced on completion |
+| **D — feature engineering** | ✅ **done** | 27 features computed per candidate pair (output of `block_features.py`) |
 | E — LightGBM classifier + singleton detector | ⏸ pending | — |
 | F — inference + threshold | ⏸ pending | — |
 | G — graph refinement | ⏸ pending | — |
 | H — packaging (submission zip) | ⏸ pending | — |
+
+**Hybrid 8-structural-key + char-trigram blocker.** Phase C and D
+were merged into a single streaming script
+`code/business_entity_resolution/scripts/block_features.py` that
+runs on **8 GB RAM** (TF-IDF and MinHash dropped for RAM fit; fuzzy
+blocking falls back to a char-trigram inverted index capped at 100
+ids per trigram). Smoke test: 2 chunks produced 500K candidate pairs
+× 36 columns in ~225 s, RAM peak ≤ 7.5 GB. S2 run is in flight at
+~100 s/chunk (~5–6 h wall-clock total).
 
 See `docs/STATUS.md` for detailed state of each phase, what failed and why, and what to retry with new hardware.
 
