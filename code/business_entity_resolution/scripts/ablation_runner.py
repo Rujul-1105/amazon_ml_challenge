@@ -63,8 +63,9 @@ S3_NORM = ARTIFACTS / "s3_norm_train.parquet"
 TRAIN_GT = PROJECT_ROOT.parent.parent / "dataset" / "student_resource" / "dataset" / "train" / "train_ground_truth.tsv"
 
 # Per-key bucket cap for ablation (lower than production's 500 → ~60% less RAM)
-# 8 GiB boxes: cap=30 keeps peak < 3 GB; 16+ GiB boxes: bump to 100/200.
-ABLATION_BUCKET_CAP = 30
+# 8 GiB boxes (smoke test): cap=30 keeps peak < 3 GB
+# 16+ GiB boxes (full ablation): cap=100 gives 3× more recall headroom
+ABLATION_BUCKET_CAP = 100
 
 # Stop tokens (literal mirror of block_features.py)
 STOP_TOKENS = {
