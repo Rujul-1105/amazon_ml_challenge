@@ -912,13 +912,25 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
     pairs = apply_floor(pairs, method["floor"])
     n_after_floor = pairs.height
 
-    # 8. Top-K cap per S1
+    # 8. Compute block_score (composite, used to rank candidates before cap)
+    # Mirrors v3 formula from block_features.py:701-709
+    pairs = pairs.with_columns([
+        (
+            0.20 * pl.min_horizontal(pl.col("n_struct_keys").fill_null(0), 3).cast(pl.Float32) / 3.0
+            + 0.45 * pl.min_horizontal(pl.col("n_tokens_shared").fill_null(0), 5).cast(pl.Float32) / 5.0
+            + 0.20 * (pl.col("sortedn_rank").fill_null(0) > 0).cast(pl.Float32)
+            + 0.15 * pl.when(pl.col("sortedn_rank").fill_null(0) > 0)
+                  .then(1.0 / (1.0 + pl.col("sortedn_rank").cast(pl.Float32)))
+                  .otherwise(0.0)
+        ).cast(pl.Float32).alias("block_score"),
+    ])
+
+    # 8b. Top-K cap per S1 (rank by block_score desc — keep highest-scoring)
     pairs = (pairs
-        .with_columns(pl.lit(1).alias("_dummy_score"))
-        .with_columns(pl.col("_dummy_score").rank(method="ordinal", descending=True)
+        .with_columns(pl.col("block_score").rank(method="ordinal", descending=True)
                           .over("source1_entity_id").alias("_r"))
         .filter(pl.col("_r") <= method["cap"])
-        .drop("_r", "_dummy_score"))
+        .drop("_r"))
     n_cands = pairs.height
 
     # 9. Recall
