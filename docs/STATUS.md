@@ -23,11 +23,29 @@ Schema per record: `entity_id, country, name_clean, name_latin, name_tokens, nam
 
 **Test files (`test_source*.tsv`) NOT touched** — train-only policy in effect.
 
-## Phase C — blocking ⏸ resume here
+## Phase C — blocking 🔄 in progress (S2 running)
 
-Methodology doc: `code/business_entity_resolution/docs/phase_c_blocking.md` (final 12-key design with first-word rationale).
+The original 12-key design (K1–K9 inverted dicts + TF-IDF K10 + MinHash K11/K12) failed 3× on the 15 GB box per the historical notes below. On the new hardware (8 GB RAM), we re-designed to a **hybrid blocker** that fits in RAM:
 
-### Three failed attempts on the 15 GB box
+- **8 cheap structural inverted indexes** (K1–K9 minus K7 addr_last_word): city, state, road, house_number, name_first_word, addr_first_word, city|state, house|road. Each is a `dict[key_value → list[entity_id]]` with per-bucket cap 500.
+- **Char-trigram inverted index** for fuzzy blocking (the cheap substitute for TF-IDF/MinHash on 8 GB RAM). 41,787 unique trigrams, 2.2 M (trigram, id) pairs.
+- MinHash and TF-IDF dropped (each is OOM-prone on 8 GB). The trigram index catches most of the typo/abbreviation/word-order cases that TF-IDF would have.
+
+Single streaming script:
+`code/business_entity_resolution/scripts/block_features.py`
+
+**Smoke test passed** (re-run on a 5% slice of S1):
+- Trigram index built in ~280 s, cand_dict (5 M entries) in ~48 s
+- 2 chunks of 10K S1 processed in ~225 s total
+- 500 K candidate pairs, 36 cols, schema correct (country_eq mean
+  0.976, addr_token_set_ratio mean 60.5)
+
+**S2 run in flight**: launched in background; expected ~5–6 h
+wall-clock (220 chunks × ~100 s). Output:
+`code/business_entity_resolution/artifacts/block_S2_features.parquet`
+(~50 M rows × 36 cols).
+
+### Historical context (the original 3 failed attempts on the 15 GB box)
 
 | # | Build plan | Where killed |
 |---|---|---|
@@ -35,19 +53,33 @@ Methodology doc: `code/business_entity_resolution/docs/phase_c_blocking.md` (fin
 | 2 | Drop MinHash, HashingVectorizer `n_features=4096`, Faiss IndexIVFFlat | at TF-IDF build |
 | 3 | Sequential-by-stage (build each index → persist → free RAM) | at startup before Stage 1 wrote anything |
 
-`_blocking_idx/` directory created but empty. No `blocks_*.parquet` written.
+The strategy was frozen because the hardware was insufficient. The
+final `src/blocking.py` was overwritten by the new hybrid design
+in `scripts/block_features.py`; the 12-key methodology doc remains
+at `docs/phase_c_blocking.md` for reference.
 
-Final `src/blocking.py` already implements the sequential-by-stage pattern + idempotent guards. It is ready to run on new hardware (≥16 GB RAM).
+## Phase D — feature engineering ✅ done
 
-### What we are NOT changing
+Done as part of Phase C in `scripts/block_features.py`. Each candidate
+pair carries 27 features:
 
-- 12-key design (K1–K12 inverted dicts + TF-IDF + MinHash) — frozen, see methodology doc.
-- Train-only policy — blocks built only on `s{1,2,3}_norm_train.parquet`.
-- Test files still untouched — they enter the picture only in Phase H inference.
+- **Polars-side (cheap):** `country_eq`, `name_first_token_eq`,
+  `name_token_jaccard`, `name_n_chars_diff`, `cross_script_pair`;
+  `addr_first_word_eq`, `addr_last_word_eq`, `addr_city_eq`,
+  `addr_house_number_eq`, `addr_state_eq`, `addr_road_eq`,
+  `addr_zip_eq`, `addr_unit_eq`, `addr_suburb_eq`;
+  `s1_name_missing`, `m_name_missing`, `s1_addr_missing`,
+  `m_addr_missing`.
+- **Python/rapidfuzz (10):** `name_token_set_ratio`, `name_partial_ratio`,
+  `name_token_sort_ratio`, `name_ratio`, `name_latin_token_set_ratio`;
+  `addr_token_set_ratio`, `addr_partial_ratio`, `addr_token_sort_ratio`,
+  `addr_ratio`, `addr_latin_token_set_ratio`.
 
-## Phase D — feature engineering ⏸
+Methodology and (pre-blocking) sample-stat rationale are documented
+in `code/business_entity_resolution/artifacts/norm_similarity_insights.md`.
 
-Not started. ~40 pairwise string-similarity features per (S1, candidate) pair. Joblib-parallelized, chunked to keep RAM ≤8 GB. Sequence per pair: name Jaccard, char-ngram Jaccard, rapidfuzz (4 ratios), LCS, length ratio, numeric overlap, is_cross_script, addr_* similarity, addr_zip_exact, addr_state_exact, addr_city_exact, candidate_rank, top-1/2/3 scores, score_spread, qratio_name, qratio_addr.
+Train-only policy in effect throughout Phase C/D (test files not
+touched; they enter the picture only in Phase H inference).
 
 ## Phase E — model training ⏸
 
