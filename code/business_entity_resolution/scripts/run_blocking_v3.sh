@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------------------
-# run_blocking_v3.sh — end-to-end Phase C v3 blocking + combine + validate
+# run_blocking_v3.sh — end-to-end Phase C v4 blocking + combine + validate
 #
-# What this does (v3 — NO trigrams; see docs/STATUS.md "Phase C v3 LOCKED-IN"):
+# What this does (M26 method: liberal_v3 floor + MinHash LSH + cap=400):
 #
 #   0. Pre-flight: check artifacts, disk, RAM
 #   1. Smoke test on S2: --dry-run --max-chunks 3  (5% slice, no final concat)
 #   2. (skip smoke if user passes --no-smoke)
 #   3. Full S2 run (detached, monitored via /tmp/block_S2.log)
 #   4. Full S3 run (detached, monitored via /tmp/block_S3.log)
-#   5. Combine S2 + S3 into block_features.parquet
-#   6. Validate recall vs train_ground_truth.tsv
+#   5. Combine S2 + S3 into block_features.parquet (lazy streaming)
+#   6. Validate recall vs train_ground_truth.tsv (lazy)
 #
-# Use on AWS EC2 (t3.medium / 8 GB works for blocking).
+# Use on a box with ≥12 GiB RAM and ≥50 GiB disk (M26 cap=400 writes
+# ~8× more candidates than v3).
 #
 # Usage:
-#   bash scripts/run_blocking_v3.sh                 # run everything
-#   bash scripts/run_blocking_v3.sh --no-smoke      # skip smoke test
-#   bash scripts/run_blocking_v3.sh --skip-s2        # S3-only
-#   bash scripts/run_blocking_v3.sh --skip-s3        # S2-only
-#   bash scripts/run_blocking_v3.sh --chunk-size 5000   # lower RAM
+#   bash scripts/run_blocking_v3.sh                  # run everything
+#   bash scripts/run_blocking_v3.sh --no-smoke       # skip smoke test
+#   bash scripts/run_blocking_v3.sh --skip-s2         # S3-only
+#   bash scripts/run_blocking_v3.sh --skip-s3         # S2-only
+#   bash scripts/run_blocking_v3.sh --no-minhash      # run v3 floor (no MinHash)
+#   bash scripts/run_blocking_v3.sh --minhash-threshold 0.4
 # ------------------------------------------------------------------------------
 set -euo pipefail
 
@@ -27,19 +29,25 @@ set -euo pipefail
 SMOKE=true
 RUN_S2=true
 RUN_S3=true
+USE_MINHASH=true
 DRY=""
 CHUNK_SIZE="${CHUNK_SIZE:-10000}"
 SN_WINDOW="${SN_WINDOW:-50}"
-TOP_K="${TOP_K:-50}"
+TOP_K="${TOP_K:-400}"
+MINHASH_THRESHOLD="${MINHASH_THRESHOLD:-0.3}"
+MINHASH_WORKERS="${MINHASH_WORKERS:-4}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-smoke)   SMOKE=false; shift ;;
     --skip-s2)    RUN_S2=false; shift ;;
     --skip-s3)    RUN_S3=false; shift ;;
+    --no-minhash) USE_MINHASH=false; shift ;;
     --chunk-size) CHUNK_SIZE="$2"; shift 2 ;;
     --sn-window)  SN_WINDOW="$2"; shift 2 ;;
     --top-k)      TOP_K="$2"; shift 2 ;;
+    --minhash-threshold) MINHASH_THRESHOLD="$2"; shift 2 ;;
+    --minhash-workers)   MINHASH_WORKERS="$2"; shift 2 ;;
     *) echo "unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -51,10 +59,11 @@ SCRIPTS="$ROOT/scripts"
 mkdir -p "$ARTIFACTS"
 
 echo "============================================================"
-echo " Phase C v3 — BLOCKING (no trigrams) "
+echo " Phase C v4 — BLOCKING (M26: MinHash + liberal_v3 + cap=$TOP_K) "
 echo " ROOT   : $ROOT"
 echo " ARTIF  : $ARTIFACTS"
 echo " CHUNK  : $CHUNK_SIZE  TOP_K : $TOP_K  SN_WINDOW : $SN_WINDOW"
+echo " MINHASH: $USE_MINHASH (threshold=$MINHASH_THRESHOLD, workers=$MINHASH_WORKERS)"
 echo "============================================================"
 
 # ---- 0. Pre-flight ----
@@ -68,17 +77,17 @@ for f in s1_norm_train.parquet s2_norm_train.parquet s3_norm_train.parquet; do
 done
 GT="$ROOT/dataset/train/train_ground_truth.tsv"
 if [[ ! -f "$GT" ]]; then
-  echo "  WARN: $GT missing — validate_block_recall.py will fail at the end."
+  echo "  WARN: $GT missing — validate_block_recall_lazy.py will fail at the end."
 fi
 FREE_GB=$(free -g | awk '/Mem:/ {print $7}')
-echo "  Free RAM: ${FREE_GB} GiB (need >=6 for v3 blocking)"
-if [[ "$FREE_GB" -lt 6 ]]; then
-  echo "  WARN: <6 GiB free — raise --chunk-size or lower --bucket-cap/--sn-window"
+echo "  Free RAM: ${FREE_GB} GiB (need >=12 for M26 blocking w/ MinHash)"
+if [[ "$FREE_GB" -lt 12 ]]; then
+  echo "  WARN: <12 GiB free — raise --chunk-size or lower --bucket-cap/--sn-window"
 fi
 DISK_FREE=$(df -BG --output=avail "$ARTIFACTS" | tail -1 | tr -dc '0-9')
-echo "  Disk free: ${DISK_FREE} GiB"
-if [[ "$DISK_FREE" -lt 25 ]]; then
-  echo "  WARN: <25 GiB free — v3 writes ~3 GB per direction + final combo"
+echo "  Disk free: ${DISK_FREE} GiB (need >=50 for cap=400 output)"
+if [[ "$DISK_FREE" -lt 50 ]]; then
+  echo "  WARN: <50 GiB free — cap=400 writes ~8x more candidates than v3"
 fi
 [[ -d "$ARTIFACTS/_chunks" ]] && rm -rf "$ARTIFACTS/_chunks" && echo "  Cleaned prior _chunks/"
 
@@ -86,10 +95,15 @@ fi
 if $SMOKE; then
   echo
   echo "[1] SMOKE TEST — S2 dry-run, 3 chunks only"
+  MINHASH_FLAG=""
+  if $USE_MINHASH; then
+    MINHASH_FLAG="--minhash --minhash-threshold $MINHASH_THRESHOLD --minhash-workers $MINHASH_WORKERS"
+  fi
   python "$SCRIPTS/block_features.py" \
       --candidate-source S2 \
       --dry-run --max-chunks 3 \
       --chunk-size "$CHUNK_SIZE" --sn-window "$SN_WINDOW" --top-k "$TOP_K" \
+      $MINHASH_FLAG \
       --suffix SMOKE
   echo "  smoke OK (no parquet written)"
   # clean chunk leftovers
@@ -99,16 +113,20 @@ fi
 # ---- 2. Full S2 ----
 if $RUN_S2; then
   echo
-  echo "[2] FULL S2 — blocking (~50-80 min on t3.medium)"
+  echo "[2] FULL S2 — blocking (~30-60 min with MinHash)"
   LOG="/tmp/block_S2.log"
+  MINHASH_FLAG=""
+  if $USE_MINHASH; then
+    MINHASH_FLAG="--minhash --minhash-threshold $MINHASH_THRESHOLD --minhash-workers $MINHASH_WORKERS"
+  fi
   setsid nohup python "$SCRIPTS/block_features.py" \
       --candidate-source S2 \
       --chunk-size "$CHUNK_SIZE" --sn-window "$SN_WINDOW" --top-k "$TOP_K" \
+      $MINHASH_FLAG \
       > "$LOG" 2>&1 < /dev/null &
   PID=$!
   echo "  S2 PID=$PID  log=$LOG"
   echo "  monitor: tail -f $LOG"
-  # wait (foreground so we crash early if S3 follows in same script)
   if wait $PID; then
     echo "  S2 done. parquet: $ARTIFACTS/block_S2_features.parquet"
   else
@@ -120,11 +138,16 @@ fi
 # ---- 3. Full S3 ----
 if $RUN_S3; then
   echo
-  echo "[3] FULL S3 — blocking (~50-80 min on t3.medium)"
+  echo "[3] FULL S3 — blocking (~30-60 min with MinHash)"
   LOG="/tmp/block_S3.log"
+  MINHASH_FLAG=""
+  if $USE_MINHASH; then
+    MINHASH_FLAG="--minhash --minhash-threshold $MINHASH_THRESHOLD --minhash-workers $MINHASH_WORKERS"
+  fi
   setsid nohup python "$SCRIPTS/block_features.py" \
       --candidate-source S3 \
       --chunk-size "$CHUNK_SIZE" --sn-window "$SN_WINDOW" --top-k "$TOP_K" \
+      $MINHASH_FLAG \
       > "$LOG" 2>&1 < /dev/null &
   PID=$!
   echo "  S3 PID=$PID  log=$LOG"
@@ -137,24 +160,24 @@ if $RUN_S3; then
   fi
 fi
 
-# ---- 4. Combine ----
+# ---- 4. Combine (lazy streaming — RAM-safe at cap=400 output) ----
 echo
-echo "[4] COMBINE — vertical concat S2 + S3"
-python "$SCRIPTS/combine_block_features.py"
+echo "[4] COMBINE — lazy concat of S2 + S3 (streaming, zstd)"
+python "$SCRIPTS/combine_block_features_lazy.py"
 
-# ---- 5. Validate ----
+# ---- 5. Validate (lazy streaming — RAM-safe at 100 M+ rows) ----
 echo
-echo "[5] VALIDATE — recall vs ground truth"
-python "$SCRIPTS/validate_block_recall.py" \
+echo "[5] VALIDATE — recall vs ground truth (lazy streaming)"
+python "$SCRIPTS/validate_block_recall_lazy.py" \
     --blocks "$ARTIFACTS/block_S2_features.parquet" \
              "$ARTIFACTS/block_S3_features.parquet" \
-    --min-recall 0.85 || {
-  echo "  RECALL FAILED — see status above. Do NOT proceed to Phase E."
+    --min-recall 0.90 || {
+  echo "  RECALL BELOW 0.90 — see status above. Do NOT proceed to Phase E without review."
   exit 3
 }
 
 echo
 echo "============================================================"
-echo " ALL DONE — Phase C v3 complete."
-echo " Recall target met. Ready for Phase E (LightGBM training)."
+echo " ALL DONE — Phase C v4 (M26 method) complete."
+echo " Recall >= 0.90. Ready for Phase E (LightGBM training)."
 echo "============================================================"

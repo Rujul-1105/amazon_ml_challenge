@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import gc
 import io
+import multiprocessing as mp
 import os
 import re
 import sys
@@ -79,6 +80,7 @@ os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 import numpy as np
 import polars as pl
 from rapidfuzz import fuzz
+from datasketch import MinHash, MinHashLSH
 
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +92,13 @@ CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 S1_NORM = ARTIFACTS / "s1_norm_train.parquet"
 S2_NORM = ARTIFACTS / "s2_norm_train.parquet"
 S3_NORM = ARTIFACTS / "s3_norm_train.parquet"
+
+# RAM/worker auto-detection (after PROJECT_ROOT is defined so we can add it to sys.path)
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from _resources import detect_resources, configure_polars_threads  # noqa: E402
+
+_RES = detect_resources(min_free_gb=8.0)
+configure_polars_threads(_RES["polars_threads"])
 
 # 18 fields loaded (entity_id + 17 features). name_tokens is unused for blocking
 # but cheap to keep alongside for downstream training alignment.
@@ -510,6 +519,16 @@ def compute_polars_features(df: pl.DataFrame) -> pl.DataFrame:
               .list.len().cast(pl.Float32).fill_null(1.0)
         ).alias("name_token_jaccard"),
 
+        # addr_token_jaccard: same formula on address fields (used by liberal_v3 floor)
+        (
+            pl.col("s1_addr_clean").fill_null("").str.split(" ")
+              .list.set_intersection(pl.col("m__addr_clean").fill_null("").str.split(" "))
+              .list.len().cast(pl.Float32)
+            / pl.col("s1_addr_clean").fill_null("").str.split(" ")
+              .list.set_union(pl.col("m__addr_clean").fill_null("").str.split(" "))
+              .list.len().cast(pl.Float32).fill_null(1.0)
+        ).alias("addr_token_jaccard"),
+
         # name_n_chars_diff (cast to Int32 BEFORE abs to avoid u32 overflow)
         (pl.col("s1_name_clean").fill_null("").str.len_chars().cast(pl.Int32)
          - pl.col("m__name_clean").fill_null("").str.len_chars().cast(pl.Int32)).abs()
@@ -615,12 +634,118 @@ def compute_fuzzy_features(df: pl.DataFrame) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# MinHash LSH index + probe (datasketch) — for fuzzy Jaccard-based candidate generation.
+# Used by Phase C v4 / M26 method (liberal_v3 floor + MinHash rescue).
+# ---------------------------------------------------------------------------
+def _minhash_worker_task(args: tuple) -> list[tuple[str, MinHash]]:
+    """Top-level worker task (must be picklable for spawn multiprocessing).
+
+    Args is (chunk_rows, num_perm). Returns list of (entity_id, MinHash).
+    """
+    chunk_rows, num_perm = args
+    from datasketch import MinHash as _MH  # noqa: F401 (always import in spawn worker)
+
+    sigs: list[tuple[str, MinHash]] = []
+    for eid, name_lat, addr_lat in chunk_rows:
+        text = (name_lat or "") + " " + (addr_lat or "")
+        if len(text) < 3:
+            continue
+        shingles = {text[i:i+3] for i in range(len(text) - 2)}
+        m = _MH(num_perm=num_perm)
+        for s in shingles:
+            m.update(s.encode("utf-8"))
+        sigs.append((eid, m))
+    return sigs
+
+
+def build_minhash_lsh_index(cand: pl.DataFrame, num_perm: int = 64,
+                              threshold: float = 0.3,
+                              n_workers: int = 1) -> tuple[MinHashLSH, dict[str, MinHash]]:
+    """Real MinHash LSH index on (name_latin + addr_latin) char 3-grams.
+
+    Parallelized via multiprocessing.Pool when n_workers > 1.
+    For 10M docs on 8 workers, ~4× speedup vs single-threaded.
+
+    Returns (lsh_index, sigs_dict). sigs_dict maps entity_id → MinHash sig.
+    """
+    print(f"   [minhash  start] num_perm={num_perm}, threshold={threshold}, workers={n_workers} ...",
+          flush=True)
+    t0 = time.time()
+    lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+
+    # Extract rows as plain Python tuples (fast pickle via mp.Pool)
+    print(f"      extracting {cand.height:,} rows...", flush=True)
+    t_extract = time.time()
+    rows = list(cand.select(["entity_id", "name_latin", "addr_latin"]).iter_rows(named=False))
+    print(f"      ... extracted in {time.time()-t_extract:.1f}s", flush=True)
+
+    chunk_size = max(50_000, len(rows) // (n_workers * 2))
+    chunks = [rows[i:i+chunk_size] for i in range(0, len(rows), chunk_size)]
+    print(f"      {len(chunks)} chunks of ~{chunk_size:,} rows", flush=True)
+
+    sigs: dict[str, MinHash] = {}
+    if n_workers <= 1 or len(chunks) <= 1:
+        for chunk in chunks:
+            for eid, m in _minhash_worker_task((chunk, num_perm)):
+                sigs[eid] = m
+                lsh.insert(eid, m, check_duplication=False)
+    else:
+        ctx = mp.get_context("spawn")
+        work_items = [(chunk, num_perm) for chunk in chunks]
+        with ctx.Pool(n_workers) as pool:
+            completed = 0
+            for batch in pool.imap_unordered(_minhash_worker_task, work_items, chunksize=1):
+                for eid, m in batch:
+                    sigs[eid] = m
+                    lsh.insert(eid, m, check_duplication=False)
+                completed += 1
+                if completed % max(1, len(chunks) // 5) == 0:
+                    pct = 100 * completed // len(chunks)
+                    print(f"      ... {pct}% chunks done ({time.time()-t0:.1f}s)",
+                          flush=True)
+
+    print(f"   [minhash  done] {len(sigs):,} sigs in {time.time()-t0:.1f}s", flush=True)
+    return lsh, sigs
+
+
+def probe_minhash_lsh_subset(s1_chunk: pl.DataFrame, lsh: MinHashLSH,
+                              sigs: dict[str, MinHash],
+                              num_perm: int = 64, threshold: float = 0.3) -> pl.DataFrame:
+    """Query LSH with each S1's MinHash sig. Returns pairs with minhash_jaccard column."""
+    pairs: list[tuple[str, str, float]] = []
+    for row in s1_chunk.select(["source1_entity_id", "name_latin", "addr_latin"]).iter_rows(named=True):
+        text = (row.get("name_latin") or "") + " " + (row.get("addr_latin") or "")
+        if len(text) < 3:
+            continue
+        shingles = {text[i:i+3] for i in range(len(text) - 2)}
+        m = MinHash(num_perm=num_perm)
+        for s in shingles:
+            m.update(s.encode("utf-8"))
+        candidates = lsh.query(m)
+        for cand_id in candidates:
+            cand_sig = sigs.get(cand_id)
+            if cand_sig is not None:
+                jac = m.jaccard(cand_sig)
+                if jac >= threshold:
+                    pairs.append((row["source1_entity_id"], cand_id, float(jac)))
+    if not pairs:
+        return pl.DataFrame(schema={
+            "source1_entity_id": pl.Utf8, "candidate_entity_id": pl.Utf8,
+            "minhash_jaccard": pl.Float32,
+        })
+    return pl.DataFrame(pairs,
+                       schema=["source1_entity_id", "candidate_entity_id", "minhash_jaccard"],
+                       orient="row")
+
+
+# ---------------------------------------------------------------------------
 # Per-chunk pipeline
 # ---------------------------------------------------------------------------
 def process_chunk(idx: int, s1_chunk: pl.DataFrame,
                   inv_struct, token_index_df,
                   sorted_canon, ids_aligned,
-                  cand_df: pl.DataFrame, args, candidate_source: str) -> tuple[int, int, int]:
+                  cand_df: pl.DataFrame, args, candidate_source: str,
+                  mh_lsh=None, mh_sigs=None) -> tuple[int, int, int]:
     t_chunk = time.time()
 
     # --- Phase 1: probe each of 3 indexes (per-S1 cap from --top-k-index) ---
@@ -629,9 +754,19 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
     sn_df     = probe_sorted_neighborhood(
                     s1_chunk, sorted_canon, ids_aligned,
                     window=args.sn_window)
+    # Phase 1d: MinHash LSH probe (if enabled via --minhash)
+    if mh_lsh is not None and mh_sigs is not None:
+        mh_df = probe_minhash_lsh_subset(
+            s1_chunk, mh_lsh, mh_sigs,
+            num_perm=args.minhash_num_perm,
+            threshold=args.minhash_threshold,
+        )
+    else:
+        mh_df = None
     n_struct = len(struct_df)
     n_tok = len(token_df)
     n_sn = len(sn_df)
+    n_mh = len(mh_df) if mh_df is not None else 0
 
     # --- Phase 2: union outer joins; fill nulls with 0; boolean flags ---
     merged = struct_df.join(token_df,
@@ -640,15 +775,24 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
     merged = merged.join(sn_df,
                          on=["source1_entity_id", "candidate_entity_id"],
                          how="full", coalesce=True)
+    if mh_df is not None:
+        merged = merged.join(mh_df,
+                             on=["source1_entity_id", "candidate_entity_id"],
+                             how="full", coalesce=True)
+    # Ensure minhash_jaccard column exists (zero-filled when --minhash not used)
+    if "minhash_jaccard" not in merged.columns:
+        merged = merged.with_columns(pl.lit(0.0).cast(pl.Float32).alias("minhash_jaccard"))
     merged = merged.with_columns([
         pl.col("n_struct_keys").fill_null(0).cast(pl.Int8),
         pl.col("n_tokens_shared").fill_null(0).cast(pl.Int8),
         pl.col("sortedn_rank").fill_null(0).cast(pl.Int16),
+        pl.col("minhash_jaccard").fill_null(0.0).cast(pl.Float32),
     ])
     merged = merged.with_columns([
         (pl.col("n_struct_keys") > 0).cast(pl.Int8).alias("from_struct"),
         (pl.col("n_tokens_shared") > 0).cast(pl.Int8).alias("from_token"),
         (pl.col("sortedn_rank") > 0).cast(pl.Int8).alias("from_sortedn"),
+        (pl.col("minhash_jaccard") > 0.0).cast(pl.Int8).alias("from_minhash"),
     ])
 
     # --- Phase 3: attach S1 + M fields (vectorized polars joins). ---
@@ -664,14 +808,20 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
     )
     n_after_country = len(merged)
 
-    # --- Phase 5: quality-tier OR filter (4 floors; STATUS.md §Phase C v3) ---
-    # floor A: n_struct_keys >= 2
-    # floor B: n_tokens_shared >= 2
-    # floor C: s1_road == m_road AND s1_city == m_city (both non-empty)
-    # floor D: 0 < sortedn_rank <= 10 AND n_tokens_shared >= 1
+    # --- Phase 5: quality-tier OR filter (liberal_v3; M26 method) ---
+    # Floor A: n_struct_keys >= 2
+    # Floor B: n_tokens_shared >= 1 (relaxed from 2 for cross-script/typo pairs)
+    # Floor C: s1_road == m_road AND s1_city == m_city (both non-empty)
+    # Floor D: 0 < sortedn_rank <= 10 AND n_tokens_shared >= 1
+    # Floor E: name_partial_ratio >= 80 (rapidfuzz)
+    # Floor F: name_token_jaccard >= 0.5
+    # Floor G: addr_token_jaccard >= 0.4 (NEW for v3.1)
+    # Floor H: cross_script_pair AND tokens AND city_eq
+    # Floor K: name_ratio >= 75
+    # Floor L: minhash_jaccard >= 0.3 (MinHash LSH rescue; only populated if --minhash)
     quality_pass_expr = (
         (pl.col("n_struct_keys") >= 2)
-        | (pl.col("n_tokens_shared") >= 2)
+        | (pl.col("n_tokens_shared") >= 1)
         | (
             pl.col("s1_addr_road").is_not_null()
             & pl.col("m__addr_road").is_not_null()
@@ -689,6 +839,16 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
             & (pl.col("sortedn_rank") <= 10)
             & (pl.col("n_tokens_shared") >= 1)
         )
+        | (pl.col("name_partial_ratio").fill_null(0.0) >= 80)
+        | (pl.col("name_token_jaccard").fill_null(0.0) >= 0.5)
+        | (pl.col("addr_token_jaccard").fill_null(0.0) >= 0.4)
+        | (
+            (pl.col("cross_script_pair").fill_null(0) == 1)
+            & (pl.col("n_tokens_shared").fill_null(0) >= 1)
+            & (pl.col("addr_city_eq").fill_null(0) == 1)
+        )
+        | (pl.col("name_ratio").fill_null(0.0) >= 75)
+        | (pl.col("minhash_jaccard").fill_null(0.0) >= 0.3)
     )
     merged = merged.filter(quality_pass_expr)
     n_after_quality = len(merged)
@@ -722,14 +882,15 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
     merged = compute_fuzzy_features(merged)
 
     # --- Phase 9: candidate_source literal + canonical column order ---
+    # Schema: 42 columns (was 40 in v3; M26 wiring adds 2: addr_token_jaccard + from_minhash)
     merged = merged.with_columns(pl.lit(candidate_source).alias("candidate_source"))
     canonical = [
         "source1_entity_id", "candidate_entity_id", "candidate_source",
         "n_struct_keys", "n_tokens_shared", "sortedn_rank",
-        "from_struct", "from_token", "from_sortedn",
+        "from_struct", "from_token", "from_sortedn", "from_minhash",
         "block_score",
         "s1_country", "m__country",
-        "country_eq", "name_first_token_eq", "name_token_jaccard",
+        "country_eq", "name_first_token_eq", "name_token_jaccard", "addr_token_jaccard",
         "name_n_chars_diff", "cross_script_pair",
         "addr_first_word_eq", "addr_last_word_eq", "addr_city_eq",
         "addr_house_number_eq", "addr_state_eq", "addr_road_eq",
@@ -739,6 +900,7 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
         "name_ratio", "name_latin_token_set_ratio",
         "addr_token_set_ratio", "addr_partial_ratio", "addr_token_sort_ratio",
         "addr_ratio", "addr_latin_token_set_ratio",
+        "minhash_jaccard",
     ]
     merged = merged.select([c for c in canonical if c in merged.columns])
 
@@ -767,8 +929,8 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--candidate-source", required=True, choices=["S2", "S3", "S2_TEST", "S3_TEST"])
-    p.add_argument("--top-k", type=int, default=50,
-                   help="Final per-S1 cap (HARD 50 per STATUS.md; never lower without recall re-check)")
+    p.add_argument("--top-k", type=int, default=400,
+                   help="Final per-S1 cap (default 400 for M26 method; was 50 for v3)")
     p.add_argument("--top-k-index", type=int, default=50,
                    help="Per-index candidates per S1 (before union + quality filter)")
     p.add_argument("--chunk-size", type=int, default=10000)
@@ -786,6 +948,15 @@ def main() -> int:
                    help="Output suffix (default: candidate source)")
     p.add_argument("--start-chunk", type=int, default=-1,
                    help="Skip chunks with idx < N (default: auto-detect from _chunks/)")
+    # M26 wiring: MinHash LSH
+    p.add_argument("--minhash", action="store_true",
+                   help="Enable MinHash LSH index + probe (M26 method)")
+    p.add_argument("--minhash-threshold", type=float, default=0.3,
+                   help="MinHash Jaccard threshold (default 0.3 for M26)")
+    p.add_argument("--minhash-num-perm", type=int, default=64,
+                   help="MinHash num_perm (default 64)")
+    p.add_argument("--minhash-workers", type=int, default=None,
+                   help="MinHash build workers (default: from detect_resources)")
     args = p.parse_args()
 
     candidate_source = args.candidate_source
@@ -826,6 +997,20 @@ def main() -> int:
     token_index = build_token_index(cand, cap=args.token_cap)
     sorted_canon, ids_aligned = build_sorted_neighborhood(cand)
     print(f"[indexes] all built in {time.time() - t0:.1f}s", flush=True)
+
+    # ---- 2b. Build MinHash LSH index (M26 method, --minhash flag) ----
+    # Built BEFORE we del cand because we need name_latin + addr_latin columns.
+    mh_lsh = None
+    mh_sigs = None
+    if args.minhash:
+        mh_workers = args.minhash_workers if args.minhash_workers is not None else _RES["n_workers"]
+        mh_lsh, mh_sigs = build_minhash_lsh_index(
+            cand,
+            num_perm=args.minhash_num_perm,
+            threshold=args.minhash_threshold,
+            n_workers=mh_workers,
+        )
+        print(f"[indexes] MinHash LSH ready ({len(mh_sigs):,} sigs)", flush=True)
 
     # ---- 3. Slim cand view (just the fields attach_fields needs) ----
     # Keep `cand` as a polars DF; vectorized joins replace the old Python
@@ -886,6 +1071,7 @@ def main() -> int:
             inv_struct, token_index,
             sorted_canon, ids_aligned,
             cand_view, args, candidate_source,
+            mh_lsh=mh_lsh, mh_sigs=mh_sigs,
         )
         total_pairs += n_pairs
 
