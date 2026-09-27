@@ -893,8 +893,7 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
         )
         | (pl.col("name_ratio").fill_null(0.0) >= 75)
         | (pl.col("minhash_jaccard").fill_null(0.0) >= 0.3)
-        # NEW Phase 2 floors
-        | (pl.col("name_token_set_ratio").fill_null(0.0) >= 90)
+        # NEW Phase 2 floors (name_token_set_ratio removed — not in df at floor time)
         | (
             (pl.col("cross_script_pair").fill_null(0) == 1)
             & (pl.col("name_token_jaccard").fill_null(0.0) >= 0.4)
