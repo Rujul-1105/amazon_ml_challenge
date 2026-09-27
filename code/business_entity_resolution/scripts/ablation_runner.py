@@ -925,6 +925,9 @@ METHODS = [
     {"name": "M24_M22+cap200", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 200, "char_trigram": False, "bigram": False, "minhash": True},
     # M25: M14 (liberal_v1 + ngram) + MinHash at threshold=0.3 (even lower, more candidates)
     {"name": "M25_M14+MinHash_loose", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": False, "bigram": False, "minhash": True, "minhash_threshold": 0.3},
+    # M26: most aggressive combo — MinHash threshold=0.3 + cap=400
+    # Pushes for max recall by catching more fuzzy candidates AND keeping more per S1
+    {"name": "M26_M24+cap400+thresh0.3", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 400, "char_trigram": False, "bigram": False, "minhash": True, "minhash_threshold": 0.3},
 ]
 
 
