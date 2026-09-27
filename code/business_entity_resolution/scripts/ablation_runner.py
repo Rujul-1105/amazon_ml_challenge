@@ -68,6 +68,10 @@ TRAIN_GT = PROJECT_ROOT.parent.parent / "dataset" / "student_resource" / "datase
 # 16+ GiB boxes (full ablation): cap=100 gives 3× more recall headroom
 ABLATION_BUCKET_CAP = 100
 
+# MinHash LSH Jaccard threshold. Lower = more candidates (more recall, more noise).
+# 0.4 = catches partial-match fuzzy candidates; 0.5 = stricter (fewer false matches).
+DEFAULT_MINHASH_THRESHOLD = 0.4
+
 # Stop tokens (literal mirror of block_features.py)
 STOP_TOKENS = {
     "the", "a", "an", "and", "or", "of", "in", "at", "on", "to", "for", "with", "by", "from",
@@ -286,7 +290,7 @@ def build_char_trigram_index(cand: pl.DataFrame, cap: int, include_latin: bool) 
 
 
 def build_minhash_lsh_index(cand: pl.DataFrame, num_perm: int = 64,
-                              threshold: float = 0.5) -> tuple[MinHashLSH, dict[str, MinHash]]:
+                              threshold: float = DEFAULT_MINHASH_THRESHOLD) -> tuple[MinHashLSH, dict[str, MinHash]]:
     """Real MinHash LSH index on (name_latin + addr_latin) char 3-grams.
 
     Returns (lsh_index, sigs_dict). sigs_dict maps entity_id → MinHash sig.
@@ -319,7 +323,7 @@ def build_minhash_lsh_index(cand: pl.DataFrame, num_perm: int = 64,
 
 def probe_minhash_lsh_subset(s1_chunk: pl.DataFrame, lsh: MinHashLSH,
                               sigs: dict[str, MinHash],
-                              num_perm: int = 64, threshold: float = 0.5) -> pl.DataFrame:
+                              num_perm: int = 64, threshold: float = DEFAULT_MINHASH_THRESHOLD) -> pl.DataFrame:
     """Query LSH with each S1's MinHash sig. Returns pairs with minhash_jaccard column."""
     pairs: list[tuple[str, str, float]] = []
     for row in s1_chunk.select(["source1_entity_id", "name_latin", "addr_latin"]).iter_rows(named=True):
@@ -768,7 +772,7 @@ def apply_floor(df: pl.DataFrame, floor_name: str) -> pl.DataFrame:
             | (pl.col("n_trigrams_shared").fill_null(0) >= 3)
             | (pl.col("n_bigrams_shared").fill_null(0) >= 1)
             | (pl.col("name_ratio").fill_null(0.0) >= 75)
-            | (pl.col("minhash_jaccard").fill_null(0.0) >= 0.5)
+            | (pl.col("minhash_jaccard").fill_null(0.0) >= 0.4)
         )
     else:
         raise ValueError(f"Unknown floor: {floor_name}")
@@ -862,10 +866,14 @@ METHODS = [
     {"name": "M21_M16+KitchenSink",    "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": True, "bigram": True, "minhash": False},  # both + name_ratio floor
 
     # M22: REAL MinHash LSH (datasketch) on (name_latin + addr_latin) char 3-grams
-    # num_perm=64, threshold=0.5. Adds proper Jaccard-based fuzzy matching.
+    # num_perm=64, threshold=DEFAULT_MINHASH_THRESHOLD (0.4). Adds proper Jaccard-based fuzzy matching.
     {"name": "M22_M16+RealMinHash", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": False, "bigram": False, "minhash": True},
     # M23: kitchen sink + real MinHash (everything combined)
     {"name": "M23_M16+ALL", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": True, "bigram": True, "minhash": True},
+    # M24: M22 with cap=200 (double the per-S1 cap for more candidate headroom)
+    {"name": "M24_M22+cap200", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 200, "char_trigram": False, "bigram": False, "minhash": True},
+    # M25: M14 (liberal_v1 + ngram) + MinHash at threshold=0.3 (even lower, more candidates)
+    {"name": "M25_M14+MinHash_loose", "struct_keys": DEFAULT_STRUCT_KEYS + NGRAM_KEYS, "token": True, "latin": True, "sortedn": True, "ngram": True, "floor": "liberal_v3", "cap": 100, "char_trigram": False, "bigram": False, "minhash": True, "minhash_threshold": 0.3},
 ]
 
 
@@ -913,8 +921,11 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
         bigram_idx = None
     if use_minhash and cached_minhash is not None:
         mh_lsh, mh_sigs = cached_minhash
+        # Per-method threshold override
+        mh_threshold = method.get("minhash_threshold", DEFAULT_MINHASH_THRESHOLD)
     else:
         mh_lsh, mh_sigs = None, {}
+        mh_threshold = DEFAULT_MINHASH_THRESHOLD
 
     # 2. Probe 10K S1
     s1_chunk = s1_meta
@@ -928,7 +939,7 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
              if ct_idx is not None else None)
     bigram_df = (probe_bigram_subset(s1_chunk, bigram_idx, top_k=200, include_latin=use_latin)
                  if bigram_idx is not None else None)
-    mh_df = (probe_minhash_lsh_subset(s1_chunk, mh_lsh, mh_sigs)
+    mh_df = (probe_minhash_lsh_subset(s1_chunk, mh_lsh, mh_sigs, threshold=mh_threshold)
              if mh_lsh is not None else None)
 
     # 3. Union (full outer join)
@@ -1181,12 +1192,20 @@ def main() -> int:
         log_resources("after-bigram")
 
     # 3c. Build real MinHash LSH index (lazy — only if any method needs it)
-    # datasketch MinHash with num_perm=64, threshold=0.5. Slowest index but most accurate.
+    # datasketch MinHash with num_perm=64, threshold=DEFAULT_MINHASH_THRESHOLD (0.4).
+    # If any method requests threshold < default, build at lowest threshold so we don't
+    # miss candidates for any method.
     cached_minhash: tuple = ()
     any_method_needs_minhash = any(m.get("minhash", False) for m in methods_to_run)
     if any_method_needs_minhash:
         log_resources("pre-minhash")
-        cached_minhash = build_minhash_lsh_index(cand_df, num_perm=64, threshold=0.5)
+        # Use the LOWEST threshold among requested methods so we don't miss candidates
+        # for methods that want looser threshold (M25 with 0.3).
+        # LSH with lower threshold = MORE candidates per query, more recall, more noise.
+        all_thresholds = [m.get("minhash_threshold", DEFAULT_MINHASH_THRESHOLD)
+                          for m in methods_to_run if m.get("minhash", False)]
+        build_threshold = min(all_thresholds) if all_thresholds else DEFAULT_MINHASH_THRESHOLD
+        cached_minhash = build_minhash_lsh_index(cand_df, num_perm=64, threshold=build_threshold)
         log_resources("after-minhash")
 
     # 4. Run all methods using cached indices
