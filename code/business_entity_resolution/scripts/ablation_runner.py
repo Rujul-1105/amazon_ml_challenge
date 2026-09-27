@@ -295,9 +295,8 @@ def _minhash_worker_task(args: tuple) -> list[tuple[str, MinHash]]:
     Args is (chunk_rows, num_perm). Returns list of (entity_id, MinHash).
     """
     chunk_rows, num_perm = args
-    import sys
-    if "datasketch" not in sys.modules:
-        from datasketch import MinHash
+    # Always import in worker (spawn re-imports modules; conditional check fails)
+    from datasketch import MinHash as _MH  # noqa: F401
 
     sigs: list[tuple[str, MinHash]] = []
     for eid, name_lat, addr_lat in chunk_rows:
@@ -305,7 +304,7 @@ def _minhash_worker_task(args: tuple) -> list[tuple[str, MinHash]]:
         if len(text) < 3:
             continue
         shingles = {text[i:i+3] for i in range(len(text) - 2)}
-        m = MinHash(num_perm=num_perm)
+        m = _MH(num_perm=num_perm)
         for s in shingles:
             m.update(s.encode("utf-8"))
         sigs.append((eid, m))
