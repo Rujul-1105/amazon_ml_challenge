@@ -985,8 +985,8 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--candidate-source", required=True, choices=["S2", "S3", "S2_TEST", "S3_TEST"])
-    p.add_argument("--top-k", type=int, default=400,
-                   help="Final per-S1 cap (default 400 for M26 method; was 50 for v3)")
+    p.add_argument("--top-k", type=int, default=200,
+                   help="Final per-S1 cap (default 200 for M24 method; was 400 for M26)")
     p.add_argument("--top-k-index", type=int, default=50,
                    help="Per-index candidates per S1 (before union + quality filter)")
     p.add_argument("--chunk-size", type=int, default=10000)
