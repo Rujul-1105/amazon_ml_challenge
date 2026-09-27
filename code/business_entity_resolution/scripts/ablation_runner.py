@@ -825,15 +825,11 @@ def apply_floor(df: pl.DataFrame, floor_name: str) -> pl.DataFrame:
             | (pl.col("n_bigrams_shared").fill_null(0) >= 1)
             | (pl.col("name_ratio").fill_null(0.0) >= 75)
             | (pl.col("minhash_jaccard").fill_null(0.0) >= 0.4)
-            # NEW Phase 2 clauses (name_token_set_ratio removed — not in df at floor time)
+            # NEW Phase 2 clause (only Floor N — addr_first/last_word_eq and
+            # name_token_set_ratio are computed AFTER the floor, not available here)
             | (
                 (pl.col("cross_script_pair").fill_null(0) == 1)
                 & (pl.col("name_token_jaccard").fill_null(0.0) >= 0.4)
-            )
-            | (
-                (pl.col("addr_first_word_eq").fill_null(0) == 1)
-                & (pl.col("addr_last_word_eq").fill_null(0) == 1)
-                & (pl.col("n_tokens_shared").fill_null(0) >= 1)
             )
         )
     else:
