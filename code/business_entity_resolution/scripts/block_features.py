@@ -808,7 +808,47 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
     )
     n_after_country = len(merged)
 
-    # --- Phase 5: quality-tier OR filter (liberal_v3; M26 method) ---
+    # --- Phase 4b: compute n_floors (count of liberal_v3 clauses satisfied) ---
+    # Done BEFORE the floor filter so we can use n_floors in the score.
+    # n_floors is the count of clauses each candidate passes; top-K by
+    # n_floors-weighted score keeps true matches at the front.
+    # The 8 base clauses match the OR filter below.
+    # (compute addr_road_eq + addr_city_eq on the fly since not yet attached)
+    # Note: addr_road_eq and addr_city_eq are computed in compute_polars_features,
+    # but we need them here for n_floors. Inline them.
+    merged = merged.with_columns([
+        # Inline structural eq for road and city (used by Floor C)
+        (pl.col("s1_addr_road").fill_null("__n__") == pl.col("m__addr_road").fill_null("__n__"))
+            .cast(pl.Int8).alias("_road_eq"),
+        (pl.col("s1_addr_city").fill_null("__n__") == pl.col("m__addr_city").fill_null("__n__"))
+            .cast(pl.Int8).alias("_city_eq"),
+    ])
+    # Now compute n_floors as sum of 8 indicator columns
+    n_floors_expr = (
+        # Floor A: n_struct_keys >= 2
+        ((pl.col("n_struct_keys") >= 2).cast(pl.Int8)) +
+        # Floor B: n_tokens_shared >= 1
+        ((pl.col("n_tokens_shared") >= 1).cast(pl.Int8)) +
+        # Floor C: road == road AND city == city (both non-empty)
+        (((pl.col("_road_eq") == 1)
+          & (pl.col("_city_eq") == 1)).cast(pl.Int8)) +
+        # Floor D: sortedn_rank > 0 AND n_tokens_shared >= 1
+        (((pl.col("sortedn_rank") > 0) & (pl.col("sortedn_rank") <= 10)
+          & (pl.col("n_tokens_shared") >= 1)).cast(pl.Int8)) +
+        # Floor E: name_partial_ratio >= 80
+        ((pl.col("name_partial_ratio").fill_null(0.0) >= 80).cast(pl.Int8)) +
+        # Floor F: name_token_jaccard >= 0.5
+        ((pl.col("name_token_jaccard").fill_null(0.0) >= 0.5).cast(pl.Int8)) +
+        # Floor G: addr_token_jaccard >= 0.4
+        ((pl.col("addr_token_jaccard").fill_null(0.0) >= 0.4).cast(pl.Int8)) +
+        # Floor L: minhash_jaccard >= 0.3
+        ((pl.col("minhash_jaccard").fill_null(0.0) >= 0.3).cast(pl.Int8))
+    ).cast(pl.Int8).alias("n_floors")
+    merged = merged.with_columns([n_floors_expr])
+    # Drop the temp _road_eq / _city_eq columns (we used them only for n_floors)
+    merged = merged.drop(["_road_eq", "_city_eq"])
+
+    # --- Phase 5: quality-tier OR filter (liberal_v3; M26 method + 3 new clauses) ---
     # Floor A: n_struct_keys >= 2
     # Floor B: n_tokens_shared >= 1 (relaxed from 2 for cross-script/typo pairs)
     # Floor C: s1_road == m_road AND s1_city == m_city (both non-empty)
@@ -819,6 +859,10 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
     # Floor H: cross_script_pair AND tokens AND city_eq
     # Floor K: name_ratio >= 75
     # Floor L: minhash_jaccard >= 0.3 (MinHash LSH rescue; only populated if --minhash)
+    # NEW Phase 2 floors:
+    # Floor M: name_token_set_ratio >= 90 (rapidfuzz)
+    # Floor N: cross_script AND name_token_jaccard >= 0.4
+    # Floor O: addr_first_word_eq == 1 AND addr_last_word_eq == 1 AND tokens >= 1
     quality_pass_expr = (
         (pl.col("n_struct_keys") >= 2)
         | (pl.col("n_tokens_shared") >= 1)
@@ -849,23 +893,40 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
         )
         | (pl.col("name_ratio").fill_null(0.0) >= 75)
         | (pl.col("minhash_jaccard").fill_null(0.0) >= 0.3)
+        # NEW Phase 2 floors
+        | (pl.col("name_token_set_ratio").fill_null(0.0) >= 90)
+        | (
+            (pl.col("cross_script_pair").fill_null(0) == 1)
+            & (pl.col("name_token_jaccard").fill_null(0.0) >= 0.4)
+        )
+        | (
+            (pl.col("addr_first_word_eq").fill_null(0) == 1)
+            & (pl.col("addr_last_word_eq").fill_null(0) == 1)
+            & (pl.col("n_tokens_shared").fill_null(0) >= 1)
+        )
     )
     merged = merged.filter(quality_pass_expr)
     n_after_quality = len(merged)
 
-    # --- Phase 6: composite score (for top-50 tiebreak only) ---
-    # struct_score capped at 3 because city/state/country trivially match.
-    # Cast to Float32 explicitly so the parquet column is Float32 (otherwise
-    # the Python float literals would promote the result to Float64, bloating
-    # the column 2× on disk).
+    # --- Phase 6: composite score (n_floors-weighted; for top-K tiebreak) ---
+    # n_floors dominates so top-K contains true matches at front.
+    # Score breakdown:
+    #   0.40 * n_floors / 8     - 40% weight on multi-clause density
+    #   0.20 * min(n_tokens_shared, 5)/5 - 20% weight on token overlap
+    #   0.15 * min(n_struct_keys, 3)/3 - 15% weight on structural match
+    #   0.10 * sortedn_rank proximity
+    #   0.10 * sortedn_rank > 0 indicator
+    #   0.05 * minhash_jaccard > 0
     merged = merged.with_columns([
         (
-            0.20 * pl.col("n_struct_keys").cast(pl.Float32) / 3.0
-            + 0.45 * pl.col("n_tokens_shared").cast(pl.Float32) / 5.0
-            + 0.20 * pl.col("sortedn_rank").gt(0).cast(pl.Float32)
-            + 0.15 * pl.when(pl.col("sortedn_rank") > 0)
+            0.40 * pl.col("n_floors").cast(pl.Float32) / 8.0
+            + 0.20 * pl.min_horizontal(pl.col("n_tokens_shared").fill_null(0), 5).cast(pl.Float32) / 5.0
+            + 0.15 * pl.min_horizontal(pl.col("n_struct_keys").fill_null(0), 3).cast(pl.Float32) / 3.0
+            + 0.10 * pl.when(pl.col("sortedn_rank") > 0)
                   .then(1.0 / (1.0 + pl.col("sortedn_rank").cast(pl.Float32)))
                   .otherwise(0.0)
+            + 0.10 * (pl.col("sortedn_rank").gt(0).cast(pl.Float32))
+            + 0.05 * (pl.col("minhash_jaccard").gt(0).cast(pl.Float32))
         ).cast(pl.Float32).alias("block_score"),
     ])
 
@@ -888,7 +949,7 @@ def process_chunk(idx: int, s1_chunk: pl.DataFrame,
         "source1_entity_id", "candidate_entity_id", "candidate_source",
         "n_struct_keys", "n_tokens_shared", "sortedn_rank",
         "from_struct", "from_token", "from_sortedn", "from_minhash",
-        "block_score",
+        "n_floors", "block_score",
         "s1_country", "m__country",
         "country_eq", "name_first_token_eq", "name_token_jaccard", "addr_token_jaccard",
         "name_n_chars_diff", "cross_script_pair",

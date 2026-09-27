@@ -797,6 +797,7 @@ def apply_floor(df: pl.DataFrame, floor_name: str) -> pl.DataFrame:
         return df.filter(pl.col("n_struct_keys").fill_null(0) >= 1)
     elif floor_name == "liberal_v3":
         # liberal_v2 + char-trigram / bigram / edit-distance / minhash rescue clauses
+        # + Phase 2: 3 new clauses (M, N, O) for higher recall
         return df.filter(
             (pl.col("n_struct_keys").fill_null(0) >= 2)
             | (pl.col("n_tokens_shared").fill_null(0) >= 1)
@@ -824,6 +825,17 @@ def apply_floor(df: pl.DataFrame, floor_name: str) -> pl.DataFrame:
             | (pl.col("n_bigrams_shared").fill_null(0) >= 1)
             | (pl.col("name_ratio").fill_null(0.0) >= 75)
             | (pl.col("minhash_jaccard").fill_null(0.0) >= 0.4)
+            # NEW Phase 2 clauses
+            | (pl.col("name_token_set_ratio").fill_null(0.0) >= 90)
+            | (
+                (pl.col("cross_script_pair").fill_null(0) == 1)
+                & (pl.col("name_token_jaccard").fill_null(0.0) >= 0.4)
+            )
+            | (
+                (pl.col("addr_first_word_eq").fill_null(0) == 1)
+                & (pl.col("addr_last_word_eq").fill_null(0) == 1)
+                & (pl.col("n_tokens_shared").fill_null(0) >= 1)
+            )
         )
     else:
         raise ValueError(f"Unknown floor: {floor_name}")
@@ -1057,22 +1069,51 @@ def run_method(method: dict, s1_meta: pl.DataFrame, cand_df: pl.DataFrame,
         if "name_token_jaccard" not in pairs.columns:
             pairs = pairs.with_columns(pl.lit(0.0).cast(pl.Float32).alias("name_token_jaccard"))
 
+    # 6b. Compute n_floors (count of liberal_v3 clauses satisfied — Phase 2)
+    # Computed AFTER features (which compute name_token_jaccard, addr_token_jaccard)
+    # but BEFORE floor filter. We need addr_road_eq / addr_city_eq for Floor C.
+    # n_floors counts 8 base clauses; the 3 NEW Phase 2 clauses are added on top.
+    road_city_match = (
+        (pl.col("s1_addr_road").fill_null("") != "")
+        & (pl.col("m__addr_road").fill_null("") != "")
+        & (pl.col("s1_addr_road") == pl.col("m__addr_road"))
+        & (pl.col("s1_addr_city").fill_null("") != "")
+        & (pl.col("m__addr_city").fill_null("") != "")
+        & (pl.col("s1_addr_city") == pl.col("m__addr_city"))
+    )
+    sortedn_match = (
+        (pl.col("sortedn_rank").fill_null(0) > 0)
+        & (pl.col("sortedn_rank") <= 10)
+        & (pl.col("n_tokens_shared").fill_null(0) >= 1)
+    )
+    n_floors_expr = (
+        (pl.col("n_struct_keys").fill_null(0) >= 2).cast(pl.Int8)
+        + (pl.col("n_tokens_shared").fill_null(0) >= 1).cast(pl.Int8)
+        + road_city_match.cast(pl.Int8)
+        + sortedn_match.cast(pl.Int8)
+        + (pl.col("name_partial_ratio").fill_null(0.0) >= 80).cast(pl.Int8)
+        + (pl.col("name_token_jaccard").fill_null(0.0) >= 0.5).cast(pl.Int8)
+        + (pl.col("addr_token_jaccard").fill_null(0.0) >= 0.4).cast(pl.Int8)
+        + (pl.col("minhash_jaccard").fill_null(0.0) >= 0.4).cast(pl.Int8)
+    ).alias("n_floors")
+    pairs = pairs.with_columns(n_floors_expr)
+
     # 7. Apply quality floor
     pairs = apply_floor(pairs, method["floor"])
     n_after_floor = pairs.height
 
-    # 8. Compute block_score (composite, used to rank candidates before cap)
-    # Mirrors v3 formula from block_features.py:701-709
+    # 8. Compute block_score (Phase 2: n_floors-weighted for better top-K ranking)
+    # n_floors dominates so top-K contains true matches at front.
     pairs = pairs.with_columns([
         (
-            0.20 * pl.min_horizontal(pl.col("n_struct_keys").fill_null(0), 3).cast(pl.Float32) / 3.0
-            + 0.45 * pl.min_horizontal(pl.col("n_tokens_shared").fill_null(0), 5).cast(pl.Float32) / 5.0
-            + 0.20 * (pl.col("sortedn_rank").fill_null(0) > 0).cast(pl.Float32)
-            + 0.15 * pl.when(pl.col("sortedn_rank").fill_null(0) > 0)
+            0.40 * pl.col("n_floors").cast(pl.Float32) / 8.0
+            + 0.20 * pl.min_horizontal(pl.col("n_tokens_shared").fill_null(0), 5).cast(pl.Float32) / 5.0
+            + 0.15 * pl.min_horizontal(pl.col("n_struct_keys").fill_null(0), 3).cast(pl.Float32) / 3.0
+            + 0.10 * pl.when(pl.col("sortedn_rank").fill_null(0) > 0)
                   .then(1.0 / (1.0 + pl.col("sortedn_rank").cast(pl.Float32)))
                   .otherwise(0.0)
-            # Add minhash boost: if real MinHash caught this pair, boost score
-            + 0.10 * (pl.col("minhash_jaccard").fill_null(0.0) > 0).cast(pl.Float32)
+            + 0.10 * (pl.col("sortedn_rank").fill_null(0) > 0).cast(pl.Float32)
+            + 0.05 * (pl.col("minhash_jaccard").fill_null(0.0) > 0).cast(pl.Float32)
         ).cast(pl.Float32).alias("block_score"),
     ])
 
