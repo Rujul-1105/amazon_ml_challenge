@@ -289,14 +289,13 @@ def build_char_trigram_index(cand: pl.DataFrame, cap: int, include_latin: bool) 
             .rename({"entity_id": "_id"}))
 
 
-def _minhash_worker(chunk_rows: list[tuple[str, str, str]], num_perm: int) -> list[tuple[str, MinHash]]:
-    """Worker function: compute MinHash sigs for a chunk of (eid, name_lat, addr_lat).
+def _minhash_worker_task(args: tuple) -> list[tuple[str, MinHash]]:
+    """Top-level worker task (must be picklable for spawn multiprocessing).
 
-    Returns list of (entity_id, MinHash) tuples. Used via multiprocessing.Pool
-    for parallel MinHash build on multi-core VMs.
+    Args is (chunk_rows, num_perm). Returns list of (entity_id, MinHash).
     """
+    chunk_rows, num_perm = args
     import sys
-    # Re-import datasketch in worker (multiprocessing spawn requires this)
     if "datasketch" not in sys.modules:
         from datasketch import MinHash
 
@@ -311,6 +310,11 @@ def _minhash_worker(chunk_rows: list[tuple[str, str, str]], num_perm: int) -> li
             m.update(s.encode("utf-8"))
         sigs.append((eid, m))
     return sigs
+
+
+def _minhash_worker(chunk_rows: list[tuple[str, str, str]], num_perm: int) -> list[tuple[str, MinHash]]:
+    """Single-process wrapper (calls _minhash_worker_task)."""
+    return _minhash_worker_task((chunk_rows, num_perm))
 
 
 def build_minhash_lsh_index(cand: pl.DataFrame, num_perm: int = 64,
@@ -351,11 +355,11 @@ def build_minhash_lsh_index(cand: pl.DataFrame, num_perm: int = 64,
         # Multi-process path
         # Use spawn to avoid forking large DataFrames
         ctx = mp.get_context("spawn")
+        # Build (chunk, num_perm) tuples — picklable for spawn
+        work_items = [(chunk, num_perm) for chunk in chunks]
         with ctx.Pool(n_workers) as pool:
             completed = 0
-            for batch in pool.imap_unordered(
-                lambda c: _minhash_worker(c, num_perm), chunks, chunksize=1
-            ):
+            for batch in pool.imap_unordered(_minhash_worker_task, work_items, chunksize=1):
                 for eid, m in batch:
                     sigs[eid] = m
                     lsh.insert(eid, m, check_duplication=False)
