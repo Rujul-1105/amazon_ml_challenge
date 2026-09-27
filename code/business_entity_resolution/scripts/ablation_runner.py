@@ -1177,8 +1177,18 @@ def main() -> int:
         print(f"\n[--no-aggressive] Skipping M17/M19/M21 (char-trigram + bigram). "
               f"Running {len(methods_to_run)} methods (M05-M16 + M20).", flush=True)
     if args.methods:
-        wanted = set(m.strip() for m in args.methods.split(","))
-        methods_to_run = [m for m in METHODS if m["name"] in wanted]
+        wanted_short = set(m.strip() for m in args.methods.split(","))
+        # Match either short prefix (e.g. "M22" matches "M22_M16+RealMinHash")
+        # OR full method name.
+        methods_to_run = [
+            m for m in METHODS
+            if m["name"].split("_")[0] in wanted_short  # short prefix match
+            or m["name"] in wanted_short                # full name match
+        ]
+        if not methods_to_run:
+            print(f"\n[--methods] ERROR: No methods matched {sorted(wanted_short)}.", flush=True)
+            print(f"             Available methods: {[m['name'].split('_')[0] + ' (' + m['name'] + ')' for m in METHODS]}", flush=True)
+            sys.exit(1)
         print(f"\n[--methods] Running {len(methods_to_run)} selected methods: "
               f"{[m['name'] for m in methods_to_run]}", flush=True)
     any_method_needs_ct = any(m.get("char_trigram", False) for m in methods_to_run)
