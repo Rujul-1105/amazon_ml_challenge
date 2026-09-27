@@ -20,13 +20,15 @@ Then later, for any worker pool:
     with mp.Pool(_RES["n_workers"]) as pool:
         ...
 
-Why we cap workers at 4 (not all cores):
-    - polars releases the GIL only at chunk boundaries, so >4 workers
-      rarely helps for polars ops and burns RAM.
-    - rapidfuzz releases the GIL per-call, so >4 helps a bit but the
-      RAM cost (1.5 GB/worker) is the binding constraint.
-    - 4 workers × 1.5 GB = 6 GB; we leave 6 GB headroom for OS + polars
-      internals. So 4 is safe on a 12 GiB-available box.
+Worker cap policy:
+    - hard_cap_workers default = 8 (allows parallel MinHash build).
+    - On 8 GiB boxes, n_workers auto-reduces to 1-2 (1.5 GB/worker × 8
+      = 12 GB headroom needed; not safe on small boxes).
+    - On 32+ GiB boxes, n_workers = 8 by default.
+    - On 128+ GiB boxes (like your VM), n_workers stays at 8 (polars is
+      already multi-threaded internally; >8 workers rarely helps for the
+      per-row MinHash loop due to GIL).
+    - Override via env var MAX_WORKERS or pass to detect_resources().
 
 Why we cap polars threads at n_workers * 2:
     - Polars is NUMA-unaware; doubling threads beyond physical cores gives
@@ -55,7 +57,7 @@ def _read_meminfo() -> dict:
 
 def detect_resources(
     min_free_gb: float = 6.0,
-    hard_cap_workers: int = 4,
+    hard_cap_workers: int = 8,
     per_worker_gb: float = 1.5,
     headroom_gb: float = 6.0,
 ) -> dict:
@@ -67,11 +69,10 @@ def detect_resources(
         Refuse to launch (raise RuntimeError) if available RAM is below this.
         Default 6.0 GiB is the minimum safe budget for any blocking run.
     hard_cap_workers : int
-        Maximum number of worker processes. Default 4 — empirically the
-        sweet spot for polars + rapidfuzz.
+        Maximum number of worker processes. Default 8 — covers MinHash
+        parallel build + rapidfuzz + polars arena.
     per_worker_gb : float
-        RAM budget per worker. Default 1.5 GiB — covers rapidfuzz string
-        materialization + polars arena chunks.
+        RAM budget per worker. Default 1.5 GiB.
     headroom_gb : float
         RAM reserved for OS + polars internal arenas + Python overhead.
         Default 6.0 GiB.
@@ -95,7 +96,10 @@ def detect_resources(
     budget = max(0.0, free_gb - headroom_gb)
     n_workers = int(budget / per_worker_gb)
     n_workers = max(1, min(n_workers, hard_cap_workers, cores))
-    polars_threads = max(1, min(cores, n_workers * 2))
+
+    # Polars threads: cap at cores but at least n_workers*2 so polars can
+    # actually use the workers we provisioned.
+    polars_threads = max(1, min(cores, max(n_workers * 2, 8)))
 
     if free_gb < min_free_gb:
         raise RuntimeError(
