@@ -1073,6 +1073,8 @@ def main() -> int:
                    help="Which candidate source to probe. S2-only halves RAM (good for smoke tests).")
     p.add_argument("--no-aggressive", action="store_true",
                    help="Skip M17-M21 (no char-trigram/bigram indices). Smoke-test mode.")
+    p.add_argument("--methods", default=None,
+                   help="Comma-separated list of method names to run (e.g. 'M22,M24,M25'). Default = all.")
     args = p.parse_args()
 
     print("=" * 70, flush=True)
@@ -1174,6 +1176,11 @@ def main() -> int:
         methods_to_run = [m for m in METHODS if not (m.get("char_trigram") or m.get("bigram"))]
         print(f"\n[--no-aggressive] Skipping M17/M19/M21 (char-trigram + bigram). "
               f"Running {len(methods_to_run)} methods (M05-M16 + M20).", flush=True)
+    if args.methods:
+        wanted = set(m.strip() for m in args.methods.split(","))
+        methods_to_run = [m for m in METHODS if m["name"] in wanted]
+        print(f"\n[--methods] Running {len(methods_to_run)} selected methods: "
+              f"{[m['name'] for m in methods_to_run]}", flush=True)
     any_method_needs_ct = any(m.get("char_trigram", False) for m in methods_to_run)
     any_method_needs_bigram = any(m.get("bigram", False) for m in methods_to_run)
     if any_method_needs_ct:
